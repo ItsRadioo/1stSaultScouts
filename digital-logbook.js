@@ -1,0 +1,209 @@
+const PHASE2_LOG_USERS=new Set(["attendantj@kbrh.local","executivedirector@kbrh.local","admin@kbrh.local"]);let currentLogScope="phase1",logUnsub=null;
+function phase2IdentityValues(){
+  const u=auth.currentUser||{};
+  const vals=[u.email,u.displayName];
+  try{
+    const keys=["email","username","userName","login","role","staffRole","accessLevel","name"];
+    const sources=[window.currentUser,window.currentStaff,window.staffProfile,window.loggedInUser,window.userProfile];
+    sources.forEach(o=>{if(o&&typeof o==="object")keys.forEach(k=>vals.push(o[k]))});
+    ["currentUser","currentStaff","staffProfile","loggedInUser","userProfile","kbrhUser","kbrhStaff"].forEach(k=>{
+      try{const o=JSON.parse(localStorage.getItem(k)||"null");if(o&&typeof o==="object")keys.forEach(x=>vals.push(o[x]))}catch(_){}
+    });
+  }catch(_){}
+  return vals.filter(v=>v!=null).map(v=>String(v).trim().toLowerCase());
+}
+function canPhase2(){
+  const vals=phase2IdentityValues();
+  return vals.some(v=>PHASE2_LOG_USERS.has(v)||v==="admin"||v==="administrator"||v==="executive director"||v==="executivedirector");
+}const LOGDOC=()=>db.collection("kbrh").doc(currentLogScope==="phase2"?"digitalLogbookPhase2":"digitalLogbook");let LS={entries:[]},AS={};const E=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function nm(r){return String(r?.name||[r?.firstName,r?.lastName].filter(Boolean).join(" ")||r?.residentName||"").trim()}
+function residents(){
+  // Use the exact normalized current roster source used by Verbal Warnings.
+  const roster=Array.isArray(AS?.roster)?AS.roster.filter(c=>c&&c!=="temp"&&!c.archived):[];
+  const phase=currentLogScope==="phase2"?"phase2":"phase1";
+  return roster
+    .filter(c=>String(c.phase||"phase1").toLowerCase()===phase)
+    .map(c=>({id:String(c.id||""),name:`${c.firstName||""} ${c.lastName||""}`.trim()}))
+    .filter(c=>c.id&&c.name);
+}
+function localNow(){let d=new Date(),p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`}
+function oneSelect(){return `<select name="rid" required><option value="">Select resident…</option>${residents().map(r=>`<option value="${E(r.id)}">${E(r.name)}</option>`).join("")}</select>`}
+function notificationFields(){return `<section class="lb-notify-box" aria-label="Staff notifications"><div class="lb-field"><label for="lb-notify-priority">Notification priority</label><select id="lb-notify-priority" name="notifyPriority"><option value="">Normal — no notification</option><option value="important">Important</option><option value="urgent">Urgent</option></select></div><div class="lb-field"><strong>Notify staff</strong><div id="lb-recipient-picker" aria-label="Notification recipients">Loading staff…</div><small class="hint">Select staff by name. Important and Urgent notifications require acknowledgement.</small></div></section>`;}
+function logNotificationSettings(formData){
+ const priority=String(formData.get("notifyPriority")||"");
+ const recipients=priority?[...new Set(formData.getAll("notifyRecipients").map(String).filter(Boolean))].sort():[];
+ if(priority&&!recipients.length)throw Error("Select at least one staff member to notify, or choose Normal.");
+ return {priority,recipients};
+}
+function staffDisplayName(profile){
+  const direct=String(profile?.name||"").trim().replace(/\s+/g," ");
+  if(direct)return direct;
+  const combined=[profile?.firstName,profile?.lastName].map(v=>String(v||"").trim()).filter(Boolean).join(" ");
+  return combined||String(profile?.email||"").trim();
+}
+function profileTimestamp(profile){
+  const value=profile?.updatedAt||profile?.createdAt||"";
+  const parsed=Date.parse(value);
+  return Number.isFinite(parsed)?parsed:0;
+}
+async function populateNotificationRecipients(root,selected=[]){
+  try{
+    const snap=await db.collection("kbrh").doc("staffProfiles").get();
+    const data=snap.exists?snap.data()||{}:{};
+    const profiles=data.profiles&&typeof data.profiles==="object"?data.profiles:{};
+    const host=root.querySelector("#lb-recipient-picker");
+    if(!host)return;
+    const candidates=[];
+    const seenUid=new Set();
+    const walk=(node,key="",depth=0)=>{
+      if(!node||typeof node!=="object"||Array.isArray(node)||depth>6)return;
+      if((node.name||node.firstName||node.lastName||node.email)&&("active" in node||node.role||node.position)){
+        const uid=String(node.uid||key||"").trim();
+        if(uid&&!seenUid.has(uid)){
+          seenUid.add(uid);
+          candidates.push({uid,name:staffDisplayName(node),email:String(node.email||"").trim(),active:node.active!==false,stamp:profileTimestamp(node)});
+        }
+        return;
+      }
+      Object.entries(node).forEach(([k,v])=>walk(v,k,depth+1));
+    };
+    walk(profiles);
+    candidates.sort((a,b)=>b.stamp-a.stamp);
+    const seenEmail=new Set();
+    const rows=candidates.filter(row=>{
+      if(!row.active)return false;
+      const emailKey=row.email.toLowerCase();
+      if(emailKey){
+        if(seenEmail.has(emailKey))return false;
+        seenEmail.add(emailKey);
+      }
+      return true;
+    }).sort((a,b)=>a.name.localeCompare(b.name));
+    root._notificationStaff=new Map(rows.map(row=>[row.uid,row]));
+    KBRHStaffPicker.mount(host,rows,{name:"notifyRecipients",selected});
+  }catch(e){
+    console.warn("Could not load notification recipients",e);
+    const host=root.querySelector("#lb-recipient-picker");if(host)host.textContent="Staff could not be loaded. Close and reopen to retry.";
+    throw e;
+  }
+}
+function logNotificationPlan(previous,settings){
+ const oldPriority=String(previous.notificationPriority||"");
+ const oldRecipients=[...new Set((previous.notificationRecipients||[]).map(String))].sort();
+ return {changed:oldPriority!==settings.priority||JSON.stringify(oldRecipients)!==JSON.stringify(settings.recipients),recipients:settings.priority?settings.recipients:[]};
+}
+async function saveLogNotificationSettings(entryId,settings,scope,directory){
+ const identity=await staff();
+ const logRef=db.collection("kbrh").doc(scope==="phase2"?"digitalLogbookPhase2":"digitalLogbook");
+ const now=new Date().toISOString();
+ const refs=new Map(settings.recipients.map(uid=>[uid,db.collection("kbrhNotifications").doc()]));
+ await db.runTransaction(async tx=>{
+  const snap=await tx.get(logRef),data=snap.exists?snap.data():{};
+  const entries=Array.isArray(data.entries)?data.entries.slice():[];
+  const index=entries.findIndex(x=>x.id===entryId);if(index<0)throw Error("Saved log entry could not be found.");
+  const entry=entries[index],plan=logNotificationPlan(entry,settings);
+  if(!plan.changed)return;
+  entries[index]={...entry,notificationPriority:settings.priority,notificationRecipients:settings.recipients,notificationSettingsUpdatedAt:now};
+  tx.set(logRef,{entries,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+  for(const uid of plan.recipients){
+   const person=directory?.get(uid)||{};
+   tx.set(refs.get(uid),{recipientUid:uid,recipientEmail:person.email||"",recipientName:person.name||"Staff",
+    priority:settings.priority,title:`${settings.priority==="urgent"?"Urgent":"Important"} Digital Log Book entry`,
+    message:String(entry.note||entry.delivered||entry.summary||"").trim(),source:"digital-logbook",requiresAcknowledgement:true,
+    logScope:scope,logEntryId:entry.id,link:`digital-logbook.html?entry=${encodeURIComponent(entry.id)}&scope=${encodeURIComponent(scope)}`,
+    createdAtIso:now,createdAt:firebase.firestore.FieldValue.serverTimestamp(),createdByUid:identity.uid||"",createdByName:identity.name||"Staff",
+    acknowledgedAt:"",acknowledgedByUid:"",acknowledgedByName:""});
+  }
+ });
+}
+function modal(title,body,save,existing=null){
+ const root=document.querySelector("#lbRoot"),scope=currentLogScope;
+ root.innerHTML=`<div class="lb-bg"><div class="lb-modal" role="dialog" aria-modal="true" aria-labelledby="lb-modal-title"><div class="lb-head"><h2 id="lb-modal-title">${E(title)}</h2><button type="button" id="lbx" aria-label="Close log entry">×</button></div><form id="lbf"><div class="lb-body">${body}${notificationFields()}</div><div class="lb-foot"><button type="button" id="lbc">Cancel</button><button type="submit">Save Entry</button></div></form></div></div>`;
+ root.querySelector('[name="notifyPriority"]').value=existing?.notificationPriority||"";
+ const loading=populateNotificationRecipients(root,existing?.notificationRecipients||[]);
+ // The submit handler awaits directory loading; avoid an unhandled rejection while it loads.
+ loading.catch(()=>{});
+ const close=()=>root.replaceChildren();root.querySelector("#lbx").onclick=close;root.querySelector("#lbc").onclick=close;
+ root.querySelector(".lb-bg").onclick=e=>{if(e.target===e.currentTarget)close()};
+ let savedId=null;
+ root.querySelector("#lbf").onsubmit=async event=>{
+  event.preventDefault();const form=event.currentTarget,button=form.querySelector('[type="submit"]');
+  if(button.disabled)return;button.disabled=true;
+  try{
+   const fd=new FormData(form);const settings=logNotificationSettings(fd);
+   if(settings.priority)await loading;
+   const saved=await save(fd);savedId=saved?.id||existing?.id||savedId;
+   if(savedId)try{await saveLogNotificationSettings(savedId,settings,scope,root._notificationStaff);}
+   catch(error){alert("Entry saved, but notification settings were not applied: "+(error.message||error)+". Reopen Edit to retry.");close();return;}
+   const pharmacy=title==="Medication Delivery"?String(fd.get("pharmacy")||""):"";
+   close();if(pharmacy&&confirm("Medication delivery saved. Record another delivery from the same pharmacy?"))setTimeout(()=>meds(pharmacy),0);
+  }catch(error){alert(error.message||"Unable to save.");}finally{button.disabled=false;}
+ };
+}
+async function staff(){return typeof getCurrentStaffIdentity==="function"?await getCurrentStaffIdentity():{uid:auth.currentUser?.uid||"",email:auth.currentUser?.email||"",name:typeof currentStaffName==="function"?currentStaffName():"Staff User"}}
+const PRESENCEDOC=()=>db.collection('kbrh').doc('phase1Presence');
+function applyLatestPresence(transaction,presenceRef,entries,residentIds){
+ const movements=entries.filter(e=>e.type==='movement'&&e.logScope!=='phase2'&&e.residentId&&['IN','OUT'].includes(e.direction));
+ for(const id of residentIds){
+  const latest=movements.filter(e=>String(e.residentId)===String(id)).sort((a,b)=>String(b.eventTime||b.createdAt||'').localeCompare(String(a.eventTime||a.createdAt||''))||String(b.createdAt||'').localeCompare(String(a.createdAt||'')))[0];
+  if(latest)transaction.set(presenceRef,{statuses:{[String(id)]:latest.direction==='OUT'?'Out':'In'},updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+ }
+}
+async function updateEntry(id,patch){
+ const st=await staff(),logRef=LOGDOC(),presenceRef=PRESENCEDOC();
+ await db.runTransaction(async tx=>{
+  const q=await tx.get(logRef);const old=q.exists?q.data():{};const a=Array.isArray(old.entries)?old.entries.slice():[];
+  const i=a.findIndex(e=>e.id===id);if(i<0)throw Error('Log entry was not found.');
+  const previous=a[i];a[i]={...previous,...patch,lastEditedAt:new Date().toISOString(),lastEditedBy:st.name||'Unknown Staff',lastEditedByUid:st.uid||''};
+  if(currentLogScope==='phase1'&&previous.type==='movement'){
+   const pSnap=await tx.get(presenceRef);const existing=pSnap.exists?(pSnap.data().statuses||{}):{};
+   const changes={};for(const rid of new Set([previous.residentId,a[i].residentId])){
+    if(!rid)continue;
+    const latest=a.filter(e=>e.type==='movement'&&String(e.residentId)===String(rid)&&['IN','OUT'].includes(e.direction)).sort((x,y)=>String(y.eventTime||y.createdAt||'').localeCompare(String(x.eventTime||x.createdAt||''))||String(y.createdAt||'').localeCompare(String(x.createdAt||'')))[0];
+    changes['statuses.'+String(rid)]=latest?(latest.direction==='OUT'?'Out':'In'):(existing[String(rid)]||'In');
+   }
+   tx.set(presenceRef,{...changes,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+  }
+  tx.set(logRef,{entries:a,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+ });
+}
+async function add(x){
+ const st=await staff(),e={logScope:currentLogScope,id:`log-${Date.now()}-${Math.random().toString(36).slice(2,7)}`,...x,enteredBy:st.name||'Unknown Staff',enteredByUid:st.uid||'',enteredByEmail:st.email||'',createdAt:new Date().toISOString()};
+ const logRef=LOGDOC();
+ await db.runTransaction(async tx=>{
+  const q=await tx.get(logRef);const d=q.exists?q.data():{};const a=Array.isArray(d.entries)?d.entries:[];
+  // Read presence before writes to keep movement and dashboard status atomic.
+  const isMovement=currentLogScope==='phase1'&&e.type==='movement'&&e.residentId&&['IN','OUT'].includes(e.direction);
+  const presenceRef=PRESENCEDOC();if(isMovement)await tx.get(presenceRef);
+  tx.set(logRef,{entries:[...a,e],updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+  if(isMovement){
+   const latest=[...a,e].filter(v=>v.type==='movement'&&String(v.residentId)===String(e.residentId)&&['IN','OUT'].includes(v.direction)).sort((x,y)=>String(y.eventTime||y.createdAt||'').localeCompare(String(x.eventTime||x.createdAt||''))||String(y.createdAt||'').localeCompare(String(x.createdAt||'')))[0];
+   tx.set(presenceRef,{['statuses.'+String(e.residentId)]:latest.direction==='OUT'?'Out':'In',updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+  }
+ });return e;
+}
+function movement(){modal("Resident In / Out",`<div class="lb-field"><label>Time</label><input type="datetime-local" name="time" value="${localNow()}" required></div><div class="lb-field"><label>Resident</label>${oneSelect()}</div><div class="lb-field"><label>In / Out</label><select name="dir" required><option value="">Select…</option><option value="OUT">Out — Resident Left</option><option value="IN">In — Resident Returned</option></select></div>`,async f=>{let r=residents().find(x=>x.id===f.get("rid"));if(!r)throw Error("Select a resident.");let dir=f.get("dir"),t=f.get("time");return await add({type:"movement",residentId:r.id,residentName:r.name,direction:dir,eventTime:new Date(t).toISOString(),summary:`${r.name} — ${dir==="OUT"?"LEFT":"RETURNED"}`})})}
+function meds(prefillPharmacy=""){modal("Medication Delivery",`<div class="lb-field"><label>Pharmacy</label><select name="pharmacy" required><option value="">Select…</option><option ${prefillPharmacy==="Medicine Shoppe"?"selected":""}>Medicine Shoppe</option><option ${prefillPharmacy==="Pharmaright"?"selected":""}>Pharmaright</option></select></div><div class="lb-field"><label>Resident</label>${oneSelect()}</div><div class="lb-field"><label>What was delivered?</label><textarea name="delivered" rows="5" required placeholder="Type what was delivered…"></textarea></div>`,async f=>{let id=String(f.get("rid")||"");if(!id)throw Error("Select a resident.");let r=residents().find(x=>x.id===id);if(!r)throw Error("Selected resident is no longer active.");let d=String(f.get("delivered")||"").trim();if(!d)throw Error("Enter what was delivered.");return await add({type:"medication",pharmacy:f.get("pharmacy"),residentIds:[r.id],residentNames:[r.name],delivered:d,summary:`Medication Delivery — ${f.get("pharmacy")}`})})}
+function note(){modal("Log Book Note",`<div class="lb-field"><label>Note</label><textarea name="note" rows="7" required placeholder="Enter details…"></textarea></div>`,async f=>{let n=String(f.get("note")||"").trim();if(!n)throw Error("Enter a note.");return await add({type:"note",note:n,summary:"Staff Note"})})}
+function repair(){
+ if(currentLogScope!=="phase2") return alert("Select the Phase 2 Log first.");
+ modal("Phase 2 Issue / Repair",`<div class="lb-field"><label>Location / Bed</label><input name="location" maxlength="120" required placeholder="e.g. Phase 2 bed 3, bathroom, kitchen"></div><div class="lb-field"><label>Issue or repair needed</label><textarea name="issue" rows="4" required maxlength="3000" placeholder="Describe the issue and action needed"></textarea></div><div class="lb-field"><label>Priority</label><select name="repairPriority"><option value="routine">Routine</option><option value="urgent">Urgent</option><option value="out-of-service">Out of service / safety concern</option></select></div><div class="lb-field"><label>Status</label><select name="repairStatus"><option value="open">Open</option><option value="in-progress">In progress</option><option value="resolved">Resolved</option></select></div>`,async f=>{
+ const location=String(f.get("location")||"").trim(),issue=String(f.get("issue")||"").trim();if(!location||!issue)throw Error("Enter a location and describe the issue.");
+ return add({type:"repair",location,issue,repairPriority:String(f.get("repairPriority")||"routine"),repairStatus:String(f.get("repairStatus")||"open"),summary:`Repair / Issue — ${location}`});
+ });
+}
+function repairDetail(e){return `<div><strong>Location:</strong> ${E(e.location||"—")} · <strong>Priority:</strong> ${E(e.repairPriority||"routine")} · <strong>Status:</strong> ${E(e.repairStatus||"open")}</div><div>${E(e.issue||"")}</div>`;}
+function dt(v){let d=new Date(v);return !v||isNaN(d)?"—":d.toLocaleString([],{dateStyle:"medium",timeStyle:"short"})}
+function toLocalInput(v){let d=new Date(v);if(isNaN(d))return localNow();let p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`}
+function render(){let b=document.querySelector("#logEntries"),a=[...(LS.entries||[])].sort((x,y)=>String(y.createdAt||"").localeCompare(String(x.createdAt||"")));b.innerHTML=a.length?a.slice(0,250).map(e=>{let d=e.type==="movement"?`<strong>${E(e.residentName)}</strong> ${e.direction==="OUT"?"left":"returned"} at ${dt(e.eventTime)}.`:e.type==="medication"?`<strong>${E(e.pharmacy)}</strong> — ${E((e.residentNames||[]).join(", "))}<br>${E(e.delivered)}`:e.type==="repair"?repairDetail(e):E(e.note||"");let edited=e.lastEditedAt?`<div class="lb-edit-note">Edited by ${E(e.lastEditedBy||"Unknown Staff")} • ${dt(e.lastEditedAt)}</div>`:"";const priority=e.notificationPriority||"";return `<article class="lb-entry ${priority?`lb-${priority}`:""}" data-log-entry-id="${E(e.id)}"><div class="lb-entry-head"><div><h3>${E(e.summary||"Log Entry")}</h3></div><div class="lb-entry-actions"><button type="button" data-edit-log="${E(e.id)}">Edit</button></div></div><div>${d}</div><div class="lb-meta">Entered by ${E(e.enteredBy||"Unknown Staff")} • ${dt(e.createdAt)}</div>${edited}</article>`}).join(""):'<p class="hint">No log entries yet.</p>';b.querySelectorAll("[data-edit-log]").forEach(x=>x.onclick=()=>editEntry(x.dataset.editLog));const focusId=new URLSearchParams(location.search).get("entry");if(focusId){const target=document.querySelector(`[data-log-entry-id="${CSS.escape(focusId)}"]`);if(target){target.classList.add("lb-deep-link");setTimeout(()=>target.scrollIntoView({behavior:"smooth",block:"center"}),50)}}}
+function editEntry(id){let e=(LS.entries||[]).find(x=>x.id===id);if(!e)return alert("Log entry not found.");const editModal=(title,body,save)=>modal(title,body,save,e);if(e.type==="movement"){let opts=residents().map(r=>`<option value="${E(r.id)}" ${String(r.id)===String(e.residentId)?"selected":""}>${E(r.name)}</option>`).join("");editModal("Edit Resident In / Out",`<div class="lb-field"><label>Time</label><input type="datetime-local" name="time" value="${toLocalInput(e.eventTime)}" required></div><div class="lb-field"><label>Resident</label><select name="rid" required>${opts}</select></div><div class="lb-field"><label>In / Out</label><select name="dir" required><option value="OUT" ${e.direction==="OUT"?"selected":""}>Out — Resident Left</option><option value="IN" ${e.direction==="IN"?"selected":""}>In — Resident Returned</option></select></div>`,async f=>{let r=residents().find(x=>x.id===f.get("rid"));if(!r)throw Error("Select a resident.");let dir=f.get("dir");await updateEntry(id,{residentId:r.id,residentName:r.name,direction:dir,eventTime:new Date(f.get("time")).toISOString(),summary:`${r.name} — ${dir==="OUT"?"LEFT":"RETURNED"}`})})}else if(e.type==="medication"){let checks=residents().map(r=>`<label class="lb-check"><input type="checkbox" name="rids" value="${E(r.id)}" ${(e.residentIds||[]).map(String).includes(String(r.id))?"checked":""}> ${E(r.name)}</label>`).join("");editModal("Edit Medication Delivery",`<div class="lb-field"><label>Pharmacy</label><select name="pharmacy" required><option ${e.pharmacy==="Medicine Shoppe"?"selected":""}>Medicine Shoppe</option><option ${e.pharmacy==="Pharmaright"?"selected":""}>Pharmaright</option></select></div><div class="lb-field"><label>Resident(s)</label><div class="lb-checks">${checks}</div></div><div class="lb-field"><label>What was delivered?</label><textarea name="delivered" rows="5" required>${E(e.delivered||"")}</textarea></div>`,async f=>{let ids=f.getAll("rids");if(!ids.length)throw Error("Select at least one resident.");let rs=residents().filter(r=>ids.includes(r.id)),d=String(f.get("delivered")||"").trim();await updateEntry(id,{pharmacy:f.get("pharmacy"),residentIds:rs.map(r=>r.id),residentNames:rs.map(r=>r.name),delivered:d,summary:`Medication Delivery — ${f.get("pharmacy")}`})})}else if(e.type==="repair"){editModal("Update Phase 2 Issue / Repair",`<div class="lb-field"><label>Location / Bed</label><input name="location" required maxlength="120" value="${E(e.location||"")}"></div><div class="lb-field"><label>Issue or repair needed</label><textarea name="issue" rows="4" required maxlength="3000">${E(e.issue||"")}</textarea></div><div class="lb-field"><label>Priority</label><select name="repairPriority">${["routine","urgent","out-of-service"].map(x=>`<option value="${x}" ${e.repairPriority===x?"selected":""}>${x}</option>`).join("")}</select></div><div class="lb-field"><label>Status</label><select name="repairStatus">${["open","in-progress","resolved"].map(x=>`<option value="${x}" ${e.repairStatus===x?"selected":""}>${x}</option>`).join("")}</select></div>`,async f=>{let location=String(f.get("location")||"").trim(),issue=String(f.get("issue")||"").trim();if(!location||!issue)throw Error("Enter a location and issue.");await updateEntry(id,{location,issue,repairPriority:String(f.get("repairPriority")),repairStatus:String(f.get("repairStatus")),summary:`Repair / Issue — ${location}`})})}else{editModal("Edit Log Book Note",`<div class="lb-field"><label>Note</label><textarea name="note" rows="7" required>${E(e.note||"")}</textarea></div>`,async f=>{let n=String(f.get("note")||"").trim();if(!n)throw Error("Enter a note.");await updateEntry(id,{note:n})})}}
+function entryDate(e){let v=e.type==="movement"&&e.eventTime?e.eventTime:e.createdAt,d=new Date(v);if(isNaN(d))return "";let p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`}
+function printReport(){let day=document.querySelector("#reportDate").value;if(!day)return alert("Select a report date.");let a=[...(LS.entries||[])].filter(e=>entryDate(e)===day).sort((x,y)=>String((x.eventTime||x.createdAt)||"").localeCompare(String((y.eventTime||y.createdAt)||"")));let title=new Date(day+"T12:00:00").toLocaleDateString([],{weekday:"long",year:"numeric",month:"long",day:"numeric"});let rows=a.map(e=>{let detail=e.type==="movement"?`${E(e.residentName)} — ${e.direction==="OUT"?"LEFT":"RETURNED"} at ${dt(e.eventTime)}`:e.type==="medication"?`${E(e.pharmacy)} — ${E((e.residentNames||[]).join(", "))}: ${E(e.delivered)}`:e.type==="repair"?`${E(e.location)} — ${E(e.issue)} (${E(e.repairStatus||"open")})`:E(e.note||"");return `<tr><td>${dt(e.eventTime||e.createdAt)}</td><td>${E(e.summary||"Log Entry")}</td><td>${detail}</td><td>${E(e.enteredBy||"Unknown Staff")}</td></tr>`}).join("");let w=window.open("","_blank","width=1000,height=800");w.document.write(`<!doctype html><html><head><title>Log Book Report - ${E(title)}</title><style>body{font-family:Arial,sans-serif;margin:28px;color:#111}h1{margin-bottom:4px}p{margin-top:0}table{width:100%;border-collapse:collapse;margin-top:20px}th,td{border:1px solid #999;padding:8px;text-align:left;vertical-align:top}th{background:#eee}@media print{body{margin:12mm}}</style></head><body><h1>Ken Brown Recovery Home</h1><p><strong>${currentLogScope==="phase2"?"Phase 2":"Phase 1"} Digital Log Book — ${E(title)}</strong></p>${a.length?`<table><thead><tr><th>Time</th><th>Entry</th><th>Details</th><th>Entered By</th></tr></thead><tbody>${rows}</tbody></table>`:"<p>No log book entries for this date.</p>"}</body></html>`);w.document.close();w.focus();setTimeout(()=>w.print(),250)}
+function updateRepairAction(){const btn=document.getElementById("phase2RepairAction");if(btn)btn.hidden=currentLogScope!=="phase2";}
+async function subscribeLog(){updateRepairAction();if(logUnsub)logUnsub();LS={entries:[]};render();logUnsub=LOGDOC().onSnapshot(s=>{LS=s.exists?s.data():{entries:[]};render()},e=>console.error(e))}
+async function start(){let sel=document.querySelector("#logbookScope");if(canPhase2()){sel.insertAdjacentHTML("beforeend",'<option value="phase2">Phase 2 Log</option>')}else{document.querySelector("#logbookSelectorCard").style.display="none"}const requestedScope=new URLSearchParams(location.search).get("scope");currentLogScope=requestedScope==="phase2"&&canPhase2()?"phase2":"phase1";sel.value=currentLogScope;sel.onchange=async()=>{let requested=sel.value;if(requested==="phase2"&&!canPhase2()){sel.value="phase1";return alert("You do not have access to the Phase 2 log book.")}currentLogScope=requested;await subscribeLog()};document.querySelector("#reportDate").value=KBRHDates.today();document.querySelector("#printReportBtn").onclick=printReport;document.querySelectorAll("[data-reason]").forEach(b=>b.onclick=()=>({movement,medication:meds,note,repair}[b.dataset.reason])());try{
+  if(typeof loadAppState==="function")AS=await loadAppState()||{};
+  if(typeof listenToAppState==="function")listenToAppState(nextState=>{AS=nextState||{}});
+}catch(e){console.warn(e)}
+await subscribeLog()}
+auth.onAuthStateChanged(u=>{if(u)start()});

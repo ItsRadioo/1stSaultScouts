@@ -1,0 +1,96 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>KBRH System Health</title><style>body{font:16px system-ui;max-width:760px;margin:32px auto;padding:0 18px;color:#19283b}section{border:1px solid #ccd6df;padding:18px;border-radius:12px;margin:16px 0}li{padding:8px 0}.ok{color:#166534}.bad{color:#a21d1d}button{background:#173c5c;color:#fff;border:0;border-radius:8px;padding:12px 18px;cursor:pointer}small{color:#586579}</style><style data-original-file="kbrh-sidebar.css">
+/* KBRH sitewide navy sidebar refresh. Existing page forms and business logic preserved. */
+:root{--kbrh-navy:#071b31;--kbrh-blue:#0b3465;--kbrh-action:#276ed5}
+body.kbrh-sidebar-layout{background:#f2f5fa!important;color:#14283f!important;padding-left:274px!important;min-height:100vh;box-sizing:border-box}
+#kbrh-sidebar{position:fixed;left:0;top:0;bottom:0;width:274px;box-sizing:border-box;background:linear-gradient(155deg,#06182c,#0a223d);color:white;z-index:9000;overflow-y:auto;padding:24px 16px;box-shadow:3px 0 16px #00162b26}
+.kbrh-sidebar-brand{text-align:center;border-bottom:1px solid #ffffff26;padding:12px 0 25px;margin-bottom:12px}.kbrh-logo{display:block;font-size:3rem;font-weight:900;letter-spacing:-.055em;color:white}.kbrh-sidebar-brand small{color:#e2ebf7;font-weight:600;font-size:.8rem}
+.kbrh-sidebar-links{display:grid;gap:8px}.kbrh-nav-group-label{font-size:.69rem;text-transform:uppercase;letter-spacing:.12em;color:#a8bdd6;font-weight:800;margin:12px 11px 6px}
+#kbrh-sidebar a,#kbrh-sidebar summary{display:block;padding:10px 13px;margin:2px 0;border-radius:8px;text-decoration:none;color:#eef5ff!important;font-size:.92rem;font-weight:650;cursor:pointer;background:transparent!important;box-shadow:none!important}
+#kbrh-sidebar a:hover,#kbrh-sidebar summary:hover{background:#ffffff1a!important;color:white!important}#kbrh-sidebar a[aria-current=page]{background:#245ca7!important;color:white!important}#kbrh-sidebar details a{margin-left:14px;font-size:.86rem}#kbrh-sidebar summary{list-style:none}#kbrh-sidebar summary::-webkit-details-marker{display:none}
+body.kbrh-sidebar-layout>header,body.kbrh-sidebar-layout>main,body.kbrh-sidebar-layout>footer{box-sizing:border-box;max-width:none!important;width:100%!important;margin-left:0!important}
+body.kbrh-sidebar-layout header{background:linear-gradient(105deg,#071b31,#10365e)!important;color:white!important;border-radius:0!important}body.kbrh-sidebar-layout header .app-nav{display:none!important}body.kbrh-sidebar-layout header h1,body.kbrh-sidebar-layout header .app-name,body.kbrh-sidebar-layout header .page-heading{color:white!important}
+body.kbrh-sidebar-layout main{padding:22px clamp(15px,2.2vw,34px)!important}body.kbrh-sidebar-layout main .card{border-radius:12px;border:1px solid #e0e6ef;box-shadow:0 2px 8px #091c3510;background:white}
+body.kbrh-sidebar-layout button.primary-action-btn,body.kbrh-sidebar-layout button.primary{background:#286cce;color:white}
+#kbrh-menu-toggle{display:none;position:fixed;top:10px;left:10px;z-index:9002;background:#245ca7;color:white;border:0;border-radius:8px;padding:9px 12px;font-weight:800}
+body.kbrh-sidebar-layout .roster-view-switch{display:none!important}
+.p2-cards{display:grid!important;grid-template-columns:repeat(3,minmax(0,1fr))!important;gap:16px;margin:10px 0 20px}
+.p2-card{border:1px solid #c9d3e0;background:#fff;border-radius:11px;overflow:hidden;min-width:0;box-shadow:0 2px 8px #0b234011}
+.p2-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;background:linear-gradient(100deg,#092e59,#0c4688);color:white;padding:13px 14px;min-height:50px;box-sizing:border-box}.p2-card-head strong{font-size:.97rem;overflow-wrap:anywhere}.p2-extension{background:#087a36;color:white;padding:7px 9px;border-radius:6px;font-size:.72rem;font-weight:800;flex-shrink:0;max-width:120px;text-align:center}
+.p2-card-content{padding:14px}.p2-field{display:grid;grid-template-columns:105px minmax(0,1fr);gap:7px;margin:9px 0;font-size:.85rem}.p2-field span{font-weight:750;color:#324a65}.p2-field strong{overflow-wrap:anywhere;color:#152338}.p2-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:20px}.p2-actions button{min-width:0;padding:10px 6px}
+.page-roster .phase2-roster-section>.table-wrap{display:none!important}.page-roster .phase2-roster-section:has(.kbrh-editing-roster)>.table-wrap{display:block!important}
+@media(max-width:1250px){.p2-cards{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(max-width:850px){body.kbrh-sidebar-layout{padding-left:0!important}#kbrh-sidebar{transform:translateX(-100%);transition:transform .2s}body.kbrh-nav-open #kbrh-sidebar{transform:translateX(0)}#kbrh-menu-toggle{display:block}body.kbrh-sidebar-layout header{padding-left:100px!important}}
+@media(max-width:620px){.p2-cards{grid-template-columns:minmax(0,1fr)!important}.p2-card-head{flex-wrap:wrap}}
+
+</style><style id="kbrh-navigation-v2">
+#kbrh-sidebar{background:linear-gradient(180deg,#061b30,#092642)!important;color:#fff!important;width:274px!important;overflow-y:auto!important}
+#kbrh-sidebar .kbrh-sidebar-brand{position:relative;padding:22px 42px 22px 16px;border-bottom:1px solid #255077;text-align:center}
+#kbrh-sidebar .kbrh-sidebar-brand .kbrh-logo{font-size:30px;font-weight:900;letter-spacing:1px;color:white}
+#kbrh-sidebar .kbrh-sidebar-brand small{display:block;color:#dce9f6}
+#kbrh-sidebar #kbrh-sidebar-collapse{position:absolute;right:8px;top:15px;width:31px;height:32px;border:1px solid #6389ad;background:#133e66;color:#fff;border-radius:7px;cursor:pointer}
+#kbrh-sidebar .kbrh-sidebar-links{padding:14px 12px 22px}
+#kbrh-sidebar details.kbrh-nav-group{display:block;margin:8px 0 13px;border:0;background:transparent}
+#kbrh-sidebar .kbrh-nav-group>summary{display:flex;align-items:center;gap:10px;list-style:none;cursor:pointer;background:linear-gradient(110deg,#0d467d,#1262a8);color:#fff!important;border-radius:9px;padding:11px 12px;font-weight:800;font-size:13px;letter-spacing:.04em}
+#kbrh-sidebar .kbrh-nav-group>summary::-webkit-details-marker{display:none}
+#kbrh-sidebar .kbrh-nav-chevron{margin-left:auto;font-size:22px;line-height:14px;transition:transform .15s}
+#kbrh-sidebar .kbrh-nav-group:not([open]) .kbrh-nav-chevron{transform:rotate(-90deg)}
+#kbrh-sidebar .kbrh-nav-items{padding:5px 0 1px 10px}
+#kbrh-sidebar a.kbrh-nav-link{display:flex!important;align-items:center;gap:12px;color:#e7effa!important;text-decoration:none!important;padding:10px 12px!important;border-radius:8px;font-size:14px;font-weight:650;min-height:38px;box-sizing:border-box}
+#kbrh-sidebar a.kbrh-nav-link:hover{background:#17446c!important;color:white!important}
+#kbrh-sidebar a.kbrh-nav-link[aria-current="page"]{background:#1971d2!important;color:white!important}
+#kbrh-sidebar .kbrh-nav-icon{display:inline-flex;justify-content:center;align-items:center;width:20px;flex-shrink:0;font-size:20px;color:white}
+body.kbrh-sidebar-layout.kbrh-nav-collapsed{padding-left:0!important}
+body.kbrh-nav-collapsed #kbrh-sidebar{transform:translateX(-100%);pointer-events:none}
+body.kbrh-nav-collapsed #kbrh-menu-toggle{display:block!important;position:fixed;left:12px;top:12px;z-index:10020;background:#125b9e;color:#fff;border-radius:8px;padding:9px 13px;box-shadow:0 2px 10px #0003}
+body.kbrh-nav-collapsed>header{padding-left:112px!important}
+@media(max-width:900px){body.kbrh-sidebar-layout{padding-left:0!important}body.kbrh-sidebar-layout #kbrh-sidebar{transform:translateX(-100%)}body.kbrh-sidebar-layout.kbrh-nav-open #kbrh-sidebar{transform:translateX(0);pointer-events:auto}body.kbrh-sidebar-layout #kbrh-menu-toggle{display:block!important;position:fixed;top:12px;left:12px;z-index:10020;background:#125b9e;color:white;padding:9px 13px;border-radius:8px}body.kbrh-sidebar-layout>header{padding-left:110px!important}}
+@media print{#kbrh-sidebar,#kbrh-menu-toggle{display:none!important}body.kbrh-sidebar-layout{padding-left:0!important}}
+</style><style id="kbrh-clear-nav-headings">
+/* KBRH clear section headings: sitewide navigation */
+#kbrh-sidebar .kbrh-nav-group{margin:12px 0 14px;border:0!important;}
+#kbrh-sidebar .kbrh-nav-group>summary{display:flex!important;align-items:center!important;gap:11px!important;background:linear-gradient(100deg,#105494,#0b417a)!important;color:#fff!important;border:1px solid rgba(112,184,255,.19)!important;border-radius:10px!important;padding:12px 14px!important;margin:0!important;min-height:46px!important;font-size:.88rem!important;font-weight:800!important;letter-spacing:.025em!important;box-shadow:0 2px 7px rgba(0,0,0,.12)!important;list-style:none!important;cursor:pointer!important;}
+#kbrh-sidebar .kbrh-nav-group>summary:hover,#kbrh-sidebar .kbrh-nav-group>summary:focus-visible{background:linear-gradient(100deg,#176bb6,#14518f)!important;outline-offset:2px;}
+#kbrh-sidebar .kbrh-nav-group>summary .kbrh-nav-icon{flex:0 0 22px;text-align:center;color:#fff!important;font-size:1.14rem!important;}
+#kbrh-sidebar .kbrh-nav-group-name{flex:1;min-width:0;}
+#kbrh-sidebar .kbrh-nav-chevron{margin-left:auto;font-size:1.25rem!important;font-weight:900;line-height:1;transition:transform .18s ease;transform:rotate(-90deg);}
+#kbrh-sidebar .kbrh-nav-group[open] .kbrh-nav-chevron{transform:rotate(0deg);}
+#kbrh-sidebar .kbrh-nav-items{padding:5px 0 2px 6px;}
+#kbrh-sidebar .kbrh-nav-items a{display:flex!important;align-items:center!important;gap:9px!important;background:transparent!important;border-radius:9px!important;min-height:38px;}
+#kbrh-sidebar .kbrh-nav-items a:hover{background:rgba(63,139,223,.24)!important;}
+#kbrh-sidebar .kbrh-nav-items a[aria-current="page"]{background:#1973d0!important;color:#fff!important;}
+</style>
+<style id="kbrh-v5-spacing-root-fix">
+/* v5 sidebar retired: the replacement owns the page offset. */
+body.kbrh-single-sidebar{--v5-sidebar:0px!important}
+html body.kbrh-single-sidebar:not(.page-login):not(.page-print):not(.page-meal-print)>main{margin:0!important;margin-left:0!important;margin-right:0!important;width:100%!important;max-width:none!important;box-sizing:border-box!important;padding:18px clamp(14px,1.5vw,26px) 40px!important}
+html body.kbrh-single-sidebar.kbrh-nav-collapsed:not(.page-login):not(.page-print):not(.page-meal-print)>main{margin:0!important;margin-left:0!important;width:100%!important;max-width:none!important;padding-left:clamp(14px,1.5vw,26px)!important;padding-right:clamp(14px,1.5vw,26px)!important}
+html body.kbrh-single-sidebar>main>.v5-page-hero,html body.kbrh-single-sidebar>main>.roster-summary,html body.kbrh-single-sidebar>main>.card,html body.kbrh-single-sidebar>main>section{grid-column:1/-1!important;min-width:0!important;max-width:100%!important}
+</style>
+<style id="kbrh-authoritative-layout">
+html,body{max-width:none!important;overflow-x:hidden!important}
+html body.kbrh-single-sidebar:not(.page-login):not(.page-print):not(.page-meal-print){
+  display:block!important;position:relative!important;width:100%!important;
+  max-width:none!important;min-width:0!important;margin:0!important;
+  padding:0 0 0 260px!important;box-sizing:border-box!important;
+  --v5-sidebar:0px!important;
+}
+html body.kbrh-single-sidebar.kbrh-nav-collapsed:not(.page-login):not(.page-print):not(.page-meal-print){
+  padding:0!important;margin:0!important;width:100%!important;max-width:none!important;
+}
+html body.kbrh-single-sidebar:not(.page-login):not(.page-print):not(.page-meal-print)>main{
+  position:relative!important;left:0!important;right:auto!important;float:none!important;
+  transform:none!important;box-sizing:border-box!important;
+  width:100%!important;max-width:none!important;min-width:0!important;
+  margin:0!important;padding:20px 24px 48px!important;
+  display:grid!important;grid-template-columns:repeat(12,minmax(0,1fr))!important;
+}
+html body.kbrh-single-sidebar:not(.page-login):not(.page-print):not(.page-meal-print)>main>section,
+html body.kbrh-single-sidebar:not(.page-login):not(.page-print):not(.page-meal-print)>main>.card{
+  grid-column:1/-1!important;min-width:0!important;max-width:none!important;
+}
+@media(max-width:700px){
+ html body.kbrh-single-sidebar:not(.page-login):not(.page-print):not(.page-meal-print){padding-left:0!important}
+ html body.kbrh-single-sidebar>main{padding:16px!important}
+}
+</style>
+<link rel="stylesheet" href="repair-5.40.css?v=5.40"></head><body><h1>KBRH System Health</h1><p>Restricted, read-only diagnostic checks. No resident names or clinical records are displayed or exported.</p><p id="app-version"></p><button id="run-health">Run checks again</button><section><ul><li>Sign-in: <strong id="auth-status">Waiting</strong></li><li>Staff profile: <strong id="profile-status">Waiting</strong></li><li>Firestore access: <strong id="db-status">Waiting</strong></li></ul></section><section id="health-details" hidden><h2>Administrator checklist</h2><p>For save errors, record the time, page, app version and error code. Do not include resident identifiers in issue reports.</p><p>Verify your organization controls GitHub, Firebase, billing/recovery email and backup credentials before handover.</p></section><p><a href="index.html">Return to dashboard</a></p><script src="date-defaults.js?v=5.40"></script><script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script><script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script><script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script><script src="firebase-config.js?v=5.40"></script><script src="system-health.js?v=5.40"></script><script src="kbrh-sidebar.js?v=5.40"></script></body></html>

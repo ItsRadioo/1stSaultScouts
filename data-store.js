@@ -1,0 +1,827 @@
+const APP_DOC_REF = () => db.collection("kbrh").doc("choreTracker");
+const SETTINGS_DOC_REF = () => db.collection("kbrh").doc("settings");
+
+// v5.5.33: person-name normalization helpers used during entry/edit saves.
+function kbrhUpperName(value){
+  return typeof value === "string" ? value.toLocaleUpperCase("en-CA") : value;
+}
+function kbrhUpperFullName(value){
+  return typeof value === "string" ? value.toLocaleUpperCase("en-CA") : value;
+}
+
+function defaultKbrhSettings(){
+  return {
+    callInDay: "Monday",
+    noCallWarningThreshold: 2,
+    choreRolloverDay: "Monday",
+    choreRolloverTime: "00:01",
+    webPushVapidKey: "",
+    timeZone: "America/Toronto"
+  };
+}
+
+async function loadKbrhSettings(){
+  try{
+    const snap=await SETTINGS_DOC_REF().get();
+    const merged={...defaultKbrhSettings(),...(snap.exists?snap.data():{})};
+    window.KBRH_SETTINGS=merged;
+    return merged;
+  }catch(error){
+    console.warn("Could not load KBRH settings; using defaults.",error);
+    const fallback=defaultKbrhSettings();
+    window.KBRH_SETTINGS=fallback;
+    return fallback;
+  }
+}
+
+function normalizeActivityHistory(history){
+  return Array.isArray(history)?history.filter(Boolean).map(item=>({
+    id:item.id||crypto.randomUUID(),
+    type:item.type||"Activity",
+    summary:item.summary||item.text||"Activity recorded",
+    detail:item.detail||"",
+    staffName:item.staffName||item.author||"System",
+    staffUid:item.staffUid||item.authorUid||"",
+    staffEmail:item.staffEmail||item.authorEmail||"",
+    createdAt:item.createdAt||new Date().toISOString()
+  })):[];
+}
+
+function appendPersonActivity(person,type,summary,detail="",identity=null,createdAt=null){
+  if(!person)return;
+  const user=auth.currentUser;
+  const staffName=identity?.name||(typeof currentStaffName==="function"?currentStaffName():(user?.email||"System"));
+  person.activityHistory=normalizeActivityHistory(person.activityHistory);
+  person.activityHistory.unshift({
+    id:crypto.randomUUID(),type,summary,detail,staffName,
+    staffUid:identity?.uid||user?.uid||"",
+    staffEmail:identity?.email||user?.email||"",
+    createdAt:createdAt||new Date().toISOString()
+  });
+}
+
+
+const STANDARD_CHORES = [
+  "Bathroom",
+  "Upper floors",
+  "Main Floor (morning)",
+  "Main Floor (Night)",
+  "Basement",
+  "Outside Yardwork",
+  "Morning dishes",
+  "Resident Fridge",
+  "General Disinfecting",
+  "Special Projects"
+];
+
+function defaultAppState() {
+  return {
+    tableGenerated: false,
+    residents: [],
+    chorePreAdmissionIds: [],
+    chores: STANDARD_CHORES,
+    history: [],
+    mealSchedule: defaultMealSchedule(),
+    waitlist: [],
+    doNotReadmit: [],
+    roster: [],
+    counselingNotes: [],
+    verbalWarnings: [],
+    writeUps: [],
+    choreChecks: [],
+    choreCheckAssignments: { weekKey: "", refreshedAt: "", choreAssignments: {}, roomAssignments: {} },
+    preScreenings: [],
+    pendingAdmissions: [],
+    incidentReports: [],
+    chartData: { laundry: {}, electronics: {}, meetings: {} },
+    transferHistory: [],
+    busPassRecords: [],
+    toolSignOutRecords: [],
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function defaultMealSchedule() {
+  const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+  return {
+    weekSchedule: days.reduce((schedule, day) => {
+      schedule[day] = { lunch: "", supper1: "", supper2: "" };
+      return schedule;
+    }, {}),
+    history: []
+  };
+}
+
+function normalizeNotes(notes) {
+  if (Array.isArray(notes)) {
+    return notes.map(note => ({
+      id: note.id || crypto.randomUUID(),
+      author: note.author || "Unknown",
+      authorUid: note.authorUid || "",
+      authorEmail: note.authorEmail || "",
+      text: note.text || "",
+      createdAt: note.createdAt || new Date().toISOString()
+    }));
+  }
+
+  if (notes) {
+    return [{
+      id: crypto.randomUUID(),
+      author: "Unknown",
+      text: String(notes),
+      createdAt: new Date().toISOString()
+    }];
+  }
+
+  return [];
+}
+
+function normalizeCounselingNotes(notes) {
+  return Array.isArray(notes)
+    ? notes
+        .filter(note => note && note !== "temp")
+        .map(note => ({
+          id: note.id || crypto.randomUUID(),
+          residentId: note.residentId || "",
+          residentName: kbrhUpperFullName(note.residentName || "Unknown Resident"),
+          author: note.author || "Unknown",
+          authorUid: note.authorUid || "",
+          authorEmail: note.authorEmail || "",
+          note: note.note || "",
+          archivedResident: note.archivedResident || false,
+          createdAt: note.createdAt || new Date().toISOString()
+        }))
+    : [];
+}
+
+function getWaitlistCallPriority(item) {
+  if (item.callPriority) return item.callPriority;
+
+  const last = Array.isArray(item.callInHistory) ? item.callInHistory[0] : null;
+  if (!last) return "normal";
+
+  if (last.result === "Yes") return "normal";
+  if (last.reason === "Called late") return "late";
+
+  if (
+    last.reason === "No call" ||
+    last.reason === "Unable to reach" ||
+    last.reason === "Wrong number / disconnected"
+  ) {
+    return "nocall";
+  }
+
+  return "late";
+}
+
+// Normalize structured contact fields on both reads and writes.
+function kbrhDisplayPhone(value) {
+  const original = String(value || "").trim();
+  const digits = original.replace(/\D/g, "");
+  if (digits.length === 10) return `(${digits.slice(0,3)}) ${digits.slice(3,6)}-${digits.slice(6)}`;
+  if (digits.length === 11 && digits[0] === "1") return `(${digits.slice(1,4)}) ${digits.slice(4,7)}-${digits.slice(7)}`;
+  return original; // Do not silently discard extensions or incomplete numbers.
+}
+function kbrhDisplayAddress(value) {
+  return typeof value === "string" ? kbrhStoredTitleCase(value.trim()) : (value || "");
+}
+
+function normalizeAppState(state) {
+  const base = defaultAppState();
+  const merged = { ...base, ...(state || {}) };
+
+  merged.chores = Array.isArray(merged.chores) && merged.chores.length
+    ? merged.chores
+    : STANDARD_CHORES;
+
+  merged.residents = Array.isArray(merged.residents)
+    ? merged.residents.map((resident, index) => ({
+        id: resident.id || crypto.randomUUID(),
+        rosterClientId: resident.rosterClientId || "",
+        preAdmissionApplicantId: resident.preAdmissionApplicantId || "",
+        preAdmissionSource: resident.preAdmissionSource || "",
+        name: resident.name || `Resident ${index + 1}`,
+        choreIndex: Number.isInteger(Number(resident.choreIndex)) ? Number(resident.choreIndex) : 0,
+        exceptions: Array.isArray(resident.exceptions) ? resident.exceptions : [],
+        lockedChore: resident.lockedChore || "",
+        status: resident.status || "active",
+        awayUntil: resident.awayUntil || ""
+      }))
+    : [];
+
+  merged.chorePreAdmissionIds = Array.isArray(merged.chorePreAdmissionIds)
+    ? [...new Set(merged.chorePreAdmissionIds.filter(Boolean).map(String))]
+    : [];
+
+  merged.history = Array.isArray(merged.history) ? merged.history : [];
+  merged.mealSchedule = normalizeMealSchedule(merged.mealSchedule);
+
+  merged.doNotReadmit = Array.isArray(merged.doNotReadmit) ? merged.doNotReadmit : [];
+  merged.waitlist = Array.isArray(merged.waitlist)
+    ? merged.waitlist.filter(item => item && item !== "temp").map(item => ({
+        id: item.id || crypto.randomUUID(),
+        lastName: kbrhUpperName(item.lastName || ""),
+        firstName: kbrhUpperName(item.firstName || ""),
+        dob: item.dob || "",
+        dnrApproval: item.dnrApproval || null,
+        contact: kbrhDisplayPhone(item.contact),
+        status: item.status || "",
+        city: item.city || "",
+        dateApplied: item.dateApplied || "",
+        archived: item.archived || false,
+        archivedAt: item.archivedAt || "",
+        archiveReason: item.archiveReason || "",
+        callPriority: getWaitlistCallPriority(item),
+        waitlistPosition: Number.isFinite(Number(item.waitlistPosition)) ? Number(item.waitlistPosition) : null,
+        notes: normalizeNotes(item.notes),
+        callInHistory: Array.isArray(item.callInHistory) ? item.callInHistory : [],
+        activityHistory: normalizeActivityHistory(item.activityHistory),
+        preScreeningStatus: item.preScreeningStatus || "",
+        preScreeningCompletedAt: item.preScreeningCompletedAt || "",
+        preScreeningRecordId: item.preScreeningRecordId || "",
+        recentResident: item.recentResident === true || item.status === "Recent Resident",
+        recentDischargeDate: item.recentDischargeDate || "",
+        previousDischargeDate: item.previousDischargeDate || "",
+        lastDischargeDate: item.lastDischargeDate || "",
+        repeatAdmissionOverride: item.repeatAdmissionOverride && typeof item.repeatAdmissionOverride === "object" ? item.repeatAdmissionOverride : null
+      }))
+    : [];
+
+  merged.roster = Array.isArray(merged.roster)
+    ? merged.roster.filter(client => client && client !== "temp").map(client => ({
+        id: client.id || crypto.randomUUID(),
+        roomNumber: client.roomNumber || "",
+        clientId: client.clientId || "",
+        firstName: kbrhUpperName(client.firstName || ""),
+        lastName: kbrhUpperName(client.lastName || ""),
+        dob: client.dob || "",
+        phone: kbrhDisplayPhone(client.phone),
+        address: kbrhDisplayAddress(client.address),
+        city: client.city || "",
+        contact: kbrhUpperFullName(client.contact || ""),
+        contactPhone: kbrhDisplayPhone(client.contactPhone),
+        entryDate: client.entryDate || "",
+        expectedDischargeDate: client.expectedDischargeDate || "",
+        opocCompleted: client.opocCompleted || false,
+        // Keep urine screening history intact across every roster save/load.
+        // Previously normalizeAppState discarded these fields, causing saved
+        // screens and the THC Protocol card flag to disappear immediately.
+        urineScreens: Array.isArray(client.urineScreens)
+          ? client.urineScreens.map(screen => ({ ...screen, results: { ...(screen.results || {}) } }))
+          : [],
+        admissionStatus: client.admissionStatus || "",
+        // Explicit THC protocol state must survive normalization and page reloads.
+        // Preserve false (manual clearance), not just truthy values.
+        thcProtocolActive: typeof client.thcProtocolActive === "boolean" ? client.thcProtocolActive : null,
+        thcProtocolSetAt: client.thcProtocolSetAt || null,
+        thcProtocolClearedAt: client.thcProtocolClearedAt || null,
+        thcProtocolClearedBy: client.thcProtocolClearedBy || "",
+        thcProtocolClearReason: client.thcProtocolClearReason || "",
+        thcRetestDue: client.thcRetestDue || "",
+        phase: client.phase || "phase1",
+        phase2AdmissionDate: client.phase2AdmissionDate || "",
+        archived: client.archived || false,
+        archivedAt: client.archivedAt || "",
+        dischargedAt: client.dischargedAt || client.archivedAt || "",
+        retentionUntil: (() => { const raw = client.retentionUntil; const valid = raw && !Number.isNaN(new Date(raw).getTime()); if (valid) return raw; const base = client.dischargedAt || client.archivedAt; if (!base) return ""; const d = new Date(base); if (Number.isNaN(d.getTime())) return ""; d.setFullYear(d.getFullYear() + 2); return d.toISOString(); })(),
+        archiveReason: client.archiveReason || "",
+        dischargeOutcomeCode: client.dischargeOutcomeCode || "",
+        dischargeOutcomeLabel: client.dischargeOutcomeLabel || "",
+        dischargeNotes: client.dischargeNotes || "",
+        archivedBy: client.archivedBy || "",
+        archivedByUid: client.archivedByUid || "",
+        archivedByEmail: client.archivedByEmail || "",
+        notes: normalizeNotes(client.notes),
+        activityHistory: normalizeActivityHistory(client.activityHistory)
+      }))
+    : [];
+
+  merged.transferHistory = Array.isArray(merged.transferHistory) ? merged.transferHistory.filter(Boolean).map(item => ({
+    id:item.id||crypto.randomUUID(), applicantId:item.applicantId||"", residentId:item.residentId||"", applicantName:kbrhUpperFullName(item.applicantName||""), transferredAt:item.transferredAt||new Date().toISOString(), transferredBy:item.transferredBy||"", undone:Boolean(item.undone), undoneAt:item.undoneAt||"", applicantSnapshot:item.applicantSnapshot&&typeof item.applicantSnapshot==="object"?item.applicantSnapshot:null
+  })) : [];
+
+  merged.counselingNotes = normalizeCounselingNotes(merged.counselingNotes);
+
+  merged.verbalWarnings = Array.isArray(merged.verbalWarnings)
+    ? merged.verbalWarnings.filter(warning => warning && warning !== "temp").map(warning => ({
+        id: warning.id || crypto.randomUUID(),
+        date: warning.date || "",
+        time: warning.time || "",
+        residentId: warning.residentId || "",
+        residentName: kbrhUpperFullName(warning.residentName || ""),
+        incident: warning.incident || "",
+        staffAction: warning.staffAction || "",
+        residentResponse: warning.residentResponse || "",
+        issuer: warning.issuer || warning.staffUser || "",
+        staffUser: warning.staffUser || warning.issuer || "",
+        enteredBy: warning.enteredBy || "",
+        enteredByUid: warning.enteredByUid || "",
+        enteredByEmail: warning.enteredByEmail || "",
+        updatedBy: warning.updatedBy || "",
+        updatedByUid: warning.updatedByUid || "",
+        updatedByEmail: warning.updatedByEmail || "",
+        updatedAt: warning.updatedAt || "",
+        createdAt: warning.createdAt || new Date().toISOString()
+      }))
+    : [];
+
+
+  merged.writeUps = Array.isArray(merged.writeUps)
+    ? merged.writeUps.filter(item => item && item !== "temp").map(item => ({
+        id: item.id || crypto.randomUUID(),
+        residentId: item.residentId || "",
+        residentName: kbrhUpperFullName(item.residentName || "Unknown Resident"),
+        date: item.date || "",
+        reason: item.reason || "",
+        issuedBy: item.issuedBy || "",
+        notes: item.notes || "",
+        createdAt: item.createdAt || new Date().toISOString(),
+        updatedAt: item.updatedAt || ""
+      }))
+    : [];
+
+  merged.choreChecks = Array.isArray(merged.choreChecks)
+    ? merged.choreChecks.filter(item => item && item !== "temp").map(item => ({
+        id: item.id || crypto.randomUUID(),
+        date: item.date || "",
+        areaId: item.areaId || "",
+        areaName: item.areaName || "",
+        roomNumber: item.roomNumber || "",
+        assignedResident: item.assignedResident || "",
+        checkedBy: item.checkedBy || "",
+        checklistRecorded: item.checklistRecorded !== false && Array.isArray(item.completedItems),
+        completedItems: Array.isArray(item.completedItems) ? item.completedItems : [],
+        issuesFound: Boolean(item.issuesFound),
+        notes: item.notes || "",
+        createdAt: item.createdAt || new Date().toISOString(),
+        updatedAt: item.updatedAt || ""
+      }))
+    : [];
+
+  const assignmentSnapshot = merged.choreCheckAssignments && typeof merged.choreCheckAssignments === "object"
+    ? merged.choreCheckAssignments
+    : {};
+
+  merged.choreCheckAssignments = {
+    weekKey: assignmentSnapshot.weekKey || "",
+    refreshedAt: assignmentSnapshot.refreshedAt || "",
+    choreAssignments: assignmentSnapshot.choreAssignments && typeof assignmentSnapshot.choreAssignments === "object"
+      ? assignmentSnapshot.choreAssignments
+      : {},
+    roomAssignments: assignmentSnapshot.roomAssignments && typeof assignmentSnapshot.roomAssignments === "object"
+      ? assignmentSnapshot.roomAssignments
+      : {}
+  };
+
+  const normalizedPreScreenings = Array.isArray(merged.preScreenings)
+    ? merged.preScreenings.filter(item => item && item !== "temp").map(item => ({
+        id: item.id || crypto.randomUUID(),
+        applicantId: item.applicantId || "",
+        applicantName: kbrhUpperFullName(item.applicantName || ""),
+        status: item.status || "Not Started",
+        workflowStatus: item.workflowStatus || "",
+        staffUser: item.staffUser || "",
+        staffEmail: item.staffEmail || "",
+        staffUid: item.staffUid || "",
+        startedAt: item.startedAt || "",
+        completedAt: item.completedAt || "",
+        updatedAt: item.updatedAt || "",
+        step: item.step || "opening",
+        answers: item.answers && typeof item.answers === "object" ? item.answers : {},
+        outcome: item.outcome || "",
+        overallNotes: item.overallNotes || ""
+      }))
+    : [];
+
+  // Older builds could leave more than one pre-screening for the same applicant. Keep the
+  // most recently changed record so refreshes never resurrect an older version.
+  const latestPreScreenByApplicant = new Map();
+  for (const item of normalizedPreScreenings) {
+    const key=item.applicantId || item.id;
+    const existing=latestPreScreenByApplicant.get(key);
+    const itemTime=new Date(item.updatedAt||item.completedAt||item.startedAt||0).getTime()||0;
+    const existingTime=existing ? (new Date(existing.updatedAt||existing.completedAt||existing.startedAt||0).getTime()||0) : -1;
+    if(!existing || itemTime>=existingTime) latestPreScreenByApplicant.set(key,item);
+  }
+  merged.preScreenings = Array.from(latestPreScreenByApplicant.values());
+
+  merged.pendingAdmissions = Array.isArray(merged.pendingAdmissions)
+    ? merged.pendingAdmissions.filter(Boolean).map(item => ({
+        id: item.id || crypto.randomUUID(),
+        applicantId: item.applicantId || "",
+        applicantName: kbrhUpperFullName(item.applicantName || ""),
+        status: item.status || "Pending Admission",
+        expectedIntakeDate: item.expectedIntakeDate || "",
+        expectedIntakeTime: item.expectedIntakeTime || "",
+        reason: item.reason || "Pre-screening completed",
+        createdAt: item.createdAt || new Date().toISOString(),
+        updatedAt: item.updatedAt || item.createdAt || new Date().toISOString(),
+        createdBy: item.createdBy || "",
+        createdByUid: item.createdByUid || "",
+        createdByEmail: item.createdByEmail || "",
+        notes: item.notes || ""
+      }))
+    : [];
+
+  merged.busPassRecords = Array.isArray(merged.busPassRecords)
+    ? merged.busPassRecords.filter(Boolean).map(item => ({
+        id: item.id || crypto.randomUUID(),
+        residentId: item.residentId || "",
+        residentName: item.residentName || "",
+        issuedAt: item.issuedAt || new Date().toISOString(),
+        destination: item.destination || "",
+        passCount: Math.max(1, Number(item.passCount) || 1),
+        tripType: item.tripType || "Round Trip",
+        staffName: item.staffName || "",
+        staffUid: item.staffUid || "",
+        staffEmail: item.staffEmail || "",
+        notes: item.notes || ""
+      }))
+    : [];
+
+  merged.toolSignOutRecords = Array.isArray(merged.toolSignOutRecords)
+    ? merged.toolSignOutRecords.filter(Boolean).map(item => ({
+        id: item.id || crypto.randomUUID(),
+        residentId: item.residentId || "",
+        residentName: item.residentName || "",
+        reason: item.reason || "",
+        timeOut: item.timeOut || new Date().toISOString(),
+        timeIn: item.timeIn || "",
+        tool: item.tool || "",
+        toolId: item.toolId || "",
+        issuedByName: item.issuedByName || "",
+        issuedByUid: item.issuedByUid || "",
+        issuedByEmail: item.issuedByEmail || "",
+        returnedByName: item.returnedByName || "",
+        returnedByUid: item.returnedByUid || "",
+        returnedByEmail: item.returnedByEmail || "",
+        updatedAt: item.updatedAt || item.timeOut || new Date().toISOString()
+      }))
+    : [];
+
+  merged.incidentReports = Array.isArray(merged.incidentReports)
+    ? merged.incidentReports.filter(item => item && item !== "temp").map(item => ({
+        id: item.id || crypto.randomUUID(),
+        residentId: item.residentId || "",
+        residentName: item.residentName || "",
+        clientDob: item.clientDob || "",
+        roomNumber: item.roomNumber || "",
+        admissionDate: item.admissionDate || "",
+        incidentDate: item.incidentDate || "",
+        incidentTime: item.incidentTime || "",
+        incidentLocation: item.incidentLocation || "",
+        incidentTypes: Array.isArray(item.incidentTypes) ? item.incidentTypes : [],
+        otherIncidentType: item.otherIncidentType || "",
+        description: item.description || "",
+        immediateActions: Array.isArray(item.immediateActions) ? item.immediateActions : [],
+        otherImmediateAction: item.otherImmediateAction || "",
+        immediateActionDescription: item.immediateActionDescription || "",
+        clientInjured: item.clientInjured || "No",
+        clientInjuryDescription: item.clientInjuryDescription || "",
+        othersInjured: item.othersInjured || "No",
+        othersInjuryDescription: item.othersInjuryDescription || "",
+        witnesses: Array.isArray(item.witnesses) ? item.witnesses : [],
+        staffName: item.staffName || "",
+        staffPosition: item.staffPosition || "",
+        staffSignature: item.staffSignature || "",
+        reportDate: item.reportDate || "",
+        executiveDirectorName: item.executiveDirectorName || "",
+        dateReviewed: item.dateReviewed || "",
+        followUpRequired: item.followUpRequired || "No",
+        executiveFollowUp: item.executiveFollowUp || "",
+        executiveDirectorSignature: item.executiveDirectorSignature || "",
+        followUpDetails: item.followUpDetails || "",
+        status: item.status || "Submitted",
+        createdAt: item.createdAt || new Date().toISOString(),
+        updatedAt: item.updatedAt || ""
+      }))
+    : [];
+
+  const rawChartData = merged.chartData && typeof merged.chartData === "object" ? merged.chartData : {};
+  merged.chartData = {
+    laundry: rawChartData.laundry && typeof rawChartData.laundry === "object" ? rawChartData.laundry : {},
+    laundryDate: typeof rawChartData.laundryDate === "string" ? rawChartData.laundryDate : "",
+    electronics: rawChartData.electronics && typeof rawChartData.electronics === "object" ? rawChartData.electronics : {},
+    meetings: rawChartData.meetings && typeof rawChartData.meetings === "object" ? rawChartData.meetings : {}
+  };
+
+  return merged;
+}
+
+function normalizeMealSchedule(mealSchedule) {
+  const base = defaultMealSchedule();
+  const merged = { ...base, ...(mealSchedule || {}) };
+
+  Object.keys(base.weekSchedule).forEach(day => {
+    merged.weekSchedule[day] = {
+      lunch: merged.weekSchedule?.[day]?.lunch || "",
+      supper1: merged.weekSchedule?.[day]?.supper1 || "",
+      supper2: merged.weekSchedule?.[day]?.supper2 || ""
+    };
+  });
+
+  merged.history = Array.isArray(merged.history) ? merged.history : [];
+  return merged;
+}
+
+
+let KBRH_LAST_STATE = null;
+
+function kbrhPageName() {
+  return window.location.pathname.split("/").pop() || "index.html";
+}
+function kbrhEntityName(item, fallback="Record") {
+  return `${item?.firstName||""} ${item?.lastName||""}`.trim() || item?.residentName || item?.applicantName || item?.name || fallback;
+}
+function kbrhShort(value, max=90) {
+  const text=String(value||"").replace(/\s+/g," ").trim(); return text.length>max?text.slice(0,max-1)+"…":text;
+}
+function kbrhMapById(list){ return new Map((Array.isArray(list)?list:[]).filter(Boolean).map(x=>[x.id,x])); }
+function kbrhChanged(a,b,key){ return JSON.stringify(a?.[key]??null)!==JSON.stringify(b?.[key]??null); }
+function kbrhDiffCollection(before,after,key,label,fields=[]) {
+  const changes=[]; const bm=kbrhMapById(before?.[key]); const am=kbrhMapById(after?.[key]);
+  for(const [id,item] of am){
+    const old=bm.get(id); const name=kbrhEntityName(item,label);
+    if(!old){changes.push(`Added ${label}: ${name}`); continue;}
+    const changed=fields.filter(f=>kbrhChanged(old,item,f));
+    if(changed.length) changes.push(`Updated ${label}: ${name} (${changed.join(", ")})`);
+    const oldNotes=kbrhMapById(old.notes), newNotes=kbrhMapById(item.notes);
+    for(const [nid,note] of newNotes){if(!oldNotes.has(nid))changes.push(`Added note for ${name}: ${kbrhShort(note.text||note.note)}`);}
+    for(const nid of oldNotes.keys()){if(!newNotes.has(nid))changes.push(`Deleted note from ${name}`);}
+  }
+  for(const [id,item] of bm){if(!am.has(id))changes.push(`Removed ${label}: ${kbrhEntityName(item,label)}`);}
+  return changes;
+}
+function describeAppStateChanges(before,after){
+  if(!before) return ["Initialized shared application data"];
+  let changes=[];
+  changes.push(...kbrhDiffCollection(before,after,"roster","resident",["roomNumber","phase","archived","entryDate","expectedDischargeDate","opocCompleted"]));
+  changes.push(...kbrhDiffCollection(before,after,"waitlist","applicant",["status","callPriority","archived","dateApplied","callInHistory"]));
+  changes.push(...kbrhDiffCollection(before,after,"residents","chore assignment",["choreIndex","lockedChore","exceptions","status","awayUntil"]));
+  const simple=[
+    ["counselingNotes","counseling note"],["verbalWarnings","verbal warning"],["writeUps","write-up"],["choreChecks","chore check"],["preScreenings","pre-screening"],["incidentReports","incident report"]
+  ];
+  for(const [key,label] of simple){
+    const bm=kbrhMapById(before?.[key]), am=kbrhMapById(after?.[key]);
+    for(const [id,item] of am){const old=bm.get(id);const name=kbrhEntityName(item,label);if(!old)changes.push(`Added ${label}: ${name}`);else if(JSON.stringify(old)!==JSON.stringify(item))changes.push(`Updated ${label}: ${name}`);}
+    for(const [id,item] of bm){if(!am.has(id))changes.push(`Deleted ${label}: ${kbrhEntityName(item,label)}`);}
+  }
+  if(JSON.stringify(before.mealSchedule)!==JSON.stringify(after.mealSchedule)) changes.push("Updated meal chore schedule");
+  if(JSON.stringify(before.chartData)!==JSON.stringify(after.chartData)) changes.push("Updated charts");
+  if(JSON.stringify(before.chores)!==JSON.stringify(after.chores)) changes.push("Updated chore list");
+  return [...new Set(changes)].slice(0,30);
+}
+function stampNewNoteAuthors(before,state,identity){
+  for(const key of ["waitlist","roster"]){
+    const bm=kbrhMapById(before?.[key]);
+    for(const item of (state?.[key]||[])){
+      const oldNotes=kbrhMapById(bm.get(item.id)?.notes);
+      if(!Array.isArray(item.notes)) continue;
+      for(const note of item.notes){
+        if(!oldNotes.has(note.id) && (!note.author || note.author==="Unknown")){
+          note.author=identity.name; note.authorUid=identity.uid; note.authorEmail=identity.email;
+        }
+      }
+    }
+  }
+  const simple=[
+    ["counselingNotes","author"],["writeUps","issuedBy"],["choreChecks","checkedBy"],["incidentReports","staffName"]
+  ];
+  for(const [key,field] of simple){const old=kbrhMapById(before?.[key]);for(const rec of (state?.[key]||[])){if(!old.has(rec.id))rec[field]=identity.name;}}
+  const psOld=kbrhMapById(before?.preScreenings);for(const rec of (state?.preScreenings||[])){if(!psOld.has(rec.id)||rec.status!==psOld.get(rec.id)?.status){rec.staffUser=identity.name;rec.staffEmail=identity.email;rec.staffUid=identity.uid;}}
+}
+async function writeAuditEntry(changes,identity){
+  if(!changes.length||!identity?.uid)return;
+  try{await db.collection("kbrhAudit").add({staffUid:identity.uid,staffName:identity.name,staffEmail:identity.email,page:kbrhPageName(),changes,summary:changes[0]||"Updated application data",timestamp:firebase.firestore.FieldValue.serverTimestamp(),timestampIso:new Date().toISOString()});}
+  catch(error){console.warn("Audit log write failed",error);}
+}
+
+// v5.5.34: normalize existing stored values anywhere the automatic-case rule applies.
+// This is intentionally limited to structured fields. Narrative/clinical notes, email,
+// phone, IDs, postal codes and other free-text content are never reformatted.
+const KBRH_AUTOCASE_UPPER_KEYS = new Set([
+  "firstName", "lastName", "applicantName", "residentName", "fullName",
+  "emergencyContact", "emergencyContactName", "contactName", "contact",
+  "staffName", "executiveDirectorName", "assignedResident", "checkedBy",
+  "issuedBy", "transferredBy", "city", "province", "employer", "employerName",
+  "sourceName", "sourcesName", "incomeSourceName", "organization", "organisation",
+  "referralSource"
+]);
+const KBRH_AUTOCASE_TITLE_KEYS = new Set(["address", "street", "streetAddress"]);
+const KBRH_AUTOCASE_NEVER_PARTS = [
+  "email", "password", "phone", "tel", "note", "comment", "description",
+  "medication", "medical", "counsel", "incident", "narrative", "username",
+  "postal", "zip", "url", "uid", "id"
+];
+
+function kbrhStoredTitleCase(value) {
+  return typeof value === "string"
+    ? value.toLocaleLowerCase("en-CA").replace(/(^|[\\s'/\\-])([a-zà-öø-ÿ])/g, (_, sep, ch) => sep + ch.toLocaleUpperCase("en-CA"))
+    : value;
+}
+
+function kbrhAutoCaseModeForKey(key) {
+  const lower = String(key || "").toLowerCase();
+  if (KBRH_AUTOCASE_NEVER_PARTS.some(part => lower.includes(part))) return null;
+  if (KBRH_AUTOCASE_UPPER_KEYS.has(key)) return "upper";
+  if (KBRH_AUTOCASE_TITLE_KEYS.has(key)) return "title";
+  return null;
+}
+
+function normalizeStoredAutoCaseV5534(value) {
+  if (Array.isArray(value)) return value.map(normalizeStoredAutoCaseV5534);
+  if (!value || typeof value !== "object") return value;
+  const out = { ...value };
+  for (const [key, child] of Object.entries(out)) {
+    const mode = kbrhAutoCaseModeForKey(key);
+    if (mode && typeof child === "string" && child.trim()) {
+      out[key] = mode === "upper"
+        ? child.trim().toLocaleUpperCase("en-CA")
+        : kbrhStoredTitleCase(child.trim());
+    } else if (child && typeof child === "object") {
+      out[key] = normalizeStoredAutoCaseV5534(child);
+    }
+  }
+  return out;
+}
+
+async function migrateExistingAutoCaseV5534(rawState) {
+  const migrationKey = "retroactiveAutoCaseV5534";
+  if (rawState?._migrations?.[migrationKey]) return rawState;
+
+  const migrated = normalizeStoredAutoCaseV5534(rawState);
+  const marker = { ...(rawState?._migrations || {}), [migrationKey]: new Date().toISOString() };
+  const patch = { _migrations: marker };
+  for (const key of Object.keys(migrated)) {
+    if (key === "_migrations") continue;
+    if (JSON.stringify(migrated[key]) !== JSON.stringify(rawState?.[key])) patch[key] = migrated[key];
+  }
+
+  try {
+    await APP_DOC_REF().set(patch, { merge: true });
+    migrated._migrations = marker;
+    console.info("KBRH v5.5.34: existing applicable fields were normalized using the automatic capitalization rules.");
+  } catch (error) {
+    console.warn("KBRH v5.5.34 capitalization migration could not be persisted; normalized values will still be used for this session.", error);
+  }
+  return migrated;
+}
+
+const KBRH_ARCHIVE_RETENTION_YEARS = 2;
+let KBRH_ARCHIVE_RETENTION_CLEANUP_RUNNING = false;
+
+function expiredArchivedRosterRecords(state, now = new Date()) {
+  const roster = Array.isArray(state?.roster) ? state.roster : [];
+  const cutoff = new Date(now);
+  cutoff.setFullYear(cutoff.getFullYear() - KBRH_ARCHIVE_RETENTION_YEARS);
+
+  return roster.filter(record => {
+    if (!record || record === "temp" || !record.archived || !record.archivedAt) return false;
+    const dischargedAt = new Date(record.dischargedAt || record.archivedAt);
+    return !Number.isNaN(dischargedAt.getTime()) && dischargedAt < cutoff;
+  });
+}
+
+async function enforceArchivedRosterRetention(rawState) {
+  if (KBRH_ARCHIVE_RETENTION_CLEANUP_RUNNING) return rawState;
+  const expired = expiredArchivedRosterRecords(rawState);
+  if (!expired.length) return rawState;
+
+  KBRH_ARCHIVE_RETENTION_CLEANUP_RUNNING = true;
+  try {
+    const expiredIds = new Set(expired.map(record => String(record.id || "")));
+    const retainedRoster = (Array.isArray(rawState.roster) ? rawState.roster : [])
+      .filter(record => !expiredIds.has(String(record?.id || "")));
+
+    const backupBatch=db.batch();
+    const recoveryUntil=new Date(); recoveryUntil.setDate(recoveryUntil.getDate()+30);
+    expired.forEach(record=>{
+      const ref=db.collection("kbrhRetentionBackups").doc(`${record.id || crypto.randomUUID()}-${Date.now()}`);
+      backupBatch.set(ref,{record,deletedFromRosterAt:new Date().toISOString(),recoveryUntil:recoveryUntil.toISOString(),reason:"Automatic 2-year roster retention cleanup"},{merge:true});
+    });
+    await backupBatch.commit();
+    await APP_DOC_REF().update({ roster: retainedRoster });
+
+    const user = auth.currentUser;
+    if (user) {
+      let identity = {uid:user.uid||"",email:user.email||"",name:user.displayName||user.email||"Staff User",position:""};
+      if (typeof getCurrentStaffIdentity === "function") {
+        try { identity = await getCurrentStaffIdentity(); } catch (_) {}
+      }
+      const changes = expired.map(record => {
+        const name = `${record.firstName || ""} ${record.lastName || ""}`.trim() || "Archived resident";
+        return `Automatically deleted ${name}'s archived roster record after the 2-year retention period elapsed.`;
+      });
+      await writeAuditEntry(changes, identity);
+    }
+
+    return { ...rawState, roster: retainedRoster };
+  } catch (error) {
+    console.warn("Archived roster retention cleanup failed", error);
+    return rawState;
+  } finally {
+    KBRH_ARCHIVE_RETENTION_CLEANUP_RUNNING = false;
+  }
+}
+
+async function loadAppState() {
+  const snap = await APP_DOC_REF().get();
+  if (!snap.exists) {
+    const initial = defaultAppState();
+    await APP_DOC_REF().set(initial, { merge: true });
+    KBRH_LAST_STATE = normalizeAppState(initial);
+    return KBRH_LAST_STATE;
+  }
+  let rawState = await migrateExistingAutoCaseV5534(snap.data());
+  rawState = await enforceArchivedRosterRetention(rawState);
+  KBRH_LAST_STATE = normalizeAppState(rawState);
+  return KBRH_LAST_STATE;
+}
+
+async function saveAppState(state) {
+  let before = KBRH_LAST_STATE;
+  if (!before) {
+    const snap = await APP_DOC_REF().get();
+    before = snap.exists ? normalizeAppState(snap.data()) : null;
+  }
+  let identity = {uid:auth.currentUser?.uid||"",email:auth.currentUser?.email||"",name:auth.currentUser?.displayName||auth.currentUser?.email||"Staff User",position:""};
+  if (typeof getCurrentStaffIdentity === "function") {
+    try { identity = await getCurrentStaffIdentity(); }
+    catch (error) { console.warn("Staff identity lookup failed; continuing save with authenticated Firebase identity.", error); }
+  }
+  stampNewNoteAuthors(before, state, identity);
+  const cleaned = normalizeAppState(normalizeStoredAutoCaseV5534(state));
+  cleaned.updatedAt = new Date().toISOString();
+  const changes = describeAppStateChanges(before, cleaned);
+  await APP_DOC_REF().set(cleaned, { merge: true });
+  KBRH_LAST_STATE = normalizeAppState(cleaned);
+  try { await writeAuditEntry(changes, identity); }
+  catch(error) { console.error('Application state saved, but audit write failed',error); }
+}
+
+function listenToAppState(callback) {
+  // Serialize asynchronous migration/retention processing. Without this,
+  // callbacks for old snapshots can complete after callbacks for new ones.
+  let sequence=0;
+  let queue=Promise.resolve();
+  return APP_DOC_REF().onSnapshot(snap => {
+    const ticket=++sequence;
+    queue=queue.catch(error=>console.error('Previous roster snapshot processing failed',error)).then(async()=>{
+      if(ticket!==sequence)return;
+      if(!snap.exists){
+        const initial=defaultAppState();
+        await APP_DOC_REF().set(initial,{merge:true});
+        if(ticket!==sequence)return;
+        KBRH_LAST_STATE=normalizeAppState(initial);
+        callback(KBRH_LAST_STATE);
+        return;
+      }
+      let rawState=await migrateExistingAutoCaseV5534(snap.data());
+      if(ticket!==sequence)return;
+      rawState=await enforceArchivedRosterRetention(rawState);
+      if(ticket!==sequence)return;
+      KBRH_LAST_STATE=normalizeAppState(rawState);
+      callback(KBRH_LAST_STATE);
+    }).catch(error=>console.error('Roster listener failed',error));
+  },error=>console.error('Firestore roster listener error',error));
+}
+
+function migrateLocalStorageToFirestore() {
+  const local = localStorage.getItem("residentChoreRotator.github.v1");
+
+  if (!local) {
+    alert("No local backup data found in this browser.");
+    return;
+  }
+
+  let parsed;
+
+  try {
+    parsed = JSON.parse(local);
+  } catch {
+    alert("Could not read local browser data.");
+    return;
+  }
+
+  const confirmed = confirm(
+    "This will replace the shared online Firestore data with the data saved in this browser. Continue?"
+  );
+
+  if (!confirmed) return;
+
+  loadAppState()
+    .then(current => {
+      const next = normalizeAppState({
+        ...current,
+        ...parsed
+      });
+
+      return saveAppState(next);
+    })
+    .then(() => alert("Local browser data migrated to Firestore."))
+    .catch(error => {
+      console.error(error);
+      alert("Migration failed. Check Firebase setup and Firestore permissions.");
+    });
+}

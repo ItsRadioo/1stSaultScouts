@@ -1,0 +1,1925 @@
+let rosterState = defaultAppState();
+let editingClientId = null;
+let notesClientId = null;
+let editingAll = false;
+let rosterSearchTerm = "";
+let pendingDischargeClientId = null;
+// Preserve staff candidate edits while Firestore snapshots and writes are in flight.
+const kbrhPendingCandidateFlags = new Map();
+// Guard a just-confirmed THC change against delayed asynchronous snapshots.
+// This is a UI synchronization guard, not a replacement for Firestore persistence.
+const kbrhPendingTHCStatuses = new Map();
+function kbrhSetCandidateFlag(client, checked) {
+  const value = Boolean(checked);
+  client.phase2Candidate = value;
+  kbrhPendingCandidateFlags.set(client.id, value);
+}
+
+
+function getInputValue(id) {
+  const input = document.getElementById(id);
+  if (!input) {
+    alert(`Missing input field: ${id}`);
+    throw new Error(`Missing input field: ${id}`);
+  }
+  return input.value.trim();
+}
+
+function formatPhoneNumber(value) {
+  return kbrhDisplayPhone(value);
+}
+
+// v5.5.33: whenever a resident edit is saved, normalize person-name fields before persistence.
+function normalizeResidentNamesOnSave(client) {
+  if (!client) return client;
+  const upper = value => typeof value === "string" ? value.trim().toLocaleUpperCase("en-CA") : value;
+  client.firstName = upper(client.firstName);
+  client.lastName = upper(client.lastName);
+  if (typeof client.contact === "string") client.contact = upper(client.contact);
+  return client;
+}
+
+async function saveRoster() {
+  try {
+    // Reapply outstanding candidate changes before submitting the roster.
+    for (const client of (rosterState.roster || [])) {
+      if (client && (client.phase || "phase1") === "phase1" && kbrhPendingCandidateFlags.has(client.id))
+        client.phase2Candidate = kbrhPendingCandidateFlags.get(client.id);
+    }
+    await saveAppState(rosterState);
+    return true;
+  } catch (error) {
+    console.error("Roster save failed:", error);
+    const code = error?.code ? ` (${error.code})` : "";
+    alert(`Could not save roster${code}. Your account is signed in, but Firestore rejected the roster update. Ensure the current firestore.rules file is deployed.`);
+    return false;
+  }
+}
+
+function addClient() {
+  rosterState.roster = Array.isArray(rosterState.roster)
+    ? rosterState.roster.filter(client => client && client !== "temp")
+    : [];
+
+  const entryDate = getInputValue("entryDate");
+
+  const client = {
+    id: crypto.randomUUID(),
+    roomNumber: getInputValue("roomNumber"),
+    firstName: getInputValue("firstName"),
+    lastName: getInputValue("lastName"),
+    clientId: getInputValue("clientId"),
+    dob: getInputValue("dob"),
+    phone: formatPhoneNumber(getInputValue("phone")),
+    address: kbrhDisplayAddress(getInputValue("address")),
+    city: getInputValue("city"),
+    contact: getInputValue("contact"),
+    contactPhone: formatPhoneNumber(getInputValue("contactPhone")),
+    entryDate,
+    expectedDischargeDate: calculateExitDate(entryDate),
+    opocCompleted: false,
+    phase2AdmissionDate: "",
+    phase: "phase1",
+    archived: false,
+    archivedAt: "",
+    archiveReason: "",
+    notes: []
+  };
+
+  if (!client.firstName || !client.lastName) {
+    alert("Enter at least a first and last name.");
+    return;
+  }
+
+  if(kbrhRejectUnreadyBed(client.roomNumber))return;
+  KBRHUrine.open(client, async screen=>{
+    client.urineScreens=[screen];
+    kbrhApplyTHCProtocol(client,screen);
+    rosterState.roster.push(client);
+    if(!await saveRoster()){rosterState.roster=rosterState.roster.filter(x=>x.id!==client.id);throw Error("Save failed");}
+    clearClientForm();renderRoster();
+  },true);
+}
+
+function clearClientForm() {
+  [
+    "roomNumber", "firstName", "lastName", "clientId", "dob", "phone",
+    "address", "city", "contact", "contactPhone", "entryDate"
+  ].forEach(id => {
+    const input = document.getElementById(id);
+    if (input) input.value = "";
+  });
+}
+
+function calculateExitDate(entryDate) {
+  if (!entryDate) return "";
+
+  const [year, month, day] = entryDate.split("-").map(Number);
+  const exitDate = new Date(year, month - 1, day);
+  exitDate.setMonth(exitDate.getMonth() + 3);
+
+  if (exitDate.getDate() !== day) {
+    exitDate.setDate(0);
+  }
+
+  return exitDate.toISOString().slice(0, 10);
+}
+
+function getDischargeDate(client) {
+  return client.expectedDischargeDate || calculateExitDate(client.phase === "phase2" ? (client.phase2AdmissionDate || client.phase2EntryDate || client.entryDate) : client.entryDate);
+}
+
+function calculateDaysRemainingForClient(client) {
+  const dischargeDate = getDischargeDate(client);
+  if (!dischargeDate) return "";
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const exit = new Date(dischargeDate + "T00:00:00");
+  const diffDays = Math.ceil((exit.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+
+  if (diffDays < 0) return "Due / Past";
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "1 day";
+  return `${diffDays} days`;
+}
+
+function getDaysSinceAdmission(client) {
+  if (!client.entryDate) return 0;
+
+  const entry = new Date(client.entryDate + "T00:00:00");
+  const today = new Date();
+
+  entry.setHours(0, 0, 0, 0);
+  today.setHours(0, 0, 0, 0);
+
+  return Math.floor((today.getTime() - entry.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+function getOPOCStatus(client) {
+  const days = getDaysSinceAdmission(client);
+
+  if (client.opocCompleted) {
+    return `
+      <label class="opoc-cell opoc-complete">
+        <input type="checkbox" checked onchange="toggleOPOC('${client.id}', this.checked)" />
+        <span>Complete</span>
+      </label>
+    `;
+  }
+
+  if (!client.entryDate) {
+    return `
+      <label class="opoc-cell">
+        <input type="checkbox" onchange="toggleOPOC('${client.id}', this.checked)" />
+      </label>
+    `;
+  }
+
+  if (days >= 50) {
+    return `
+      <label class="opoc-cell opoc-overdue">
+        <input type="checkbox" onchange="toggleOPOC('${client.id}', this.checked)" />
+        <span>OVERDUE</span>
+      </label>
+    `;
+  }
+
+  if (days >= 40) {
+    return `
+      <label class="opoc-cell opoc-due">
+        <input type="checkbox" onchange="toggleOPOC('${client.id}', this.checked)" />
+        <span>OPOC Due</span>
+      </label>
+    `;
+  }
+
+  return `
+    <label class="opoc-cell">
+      <input type="checkbox" onchange="toggleOPOC('${client.id}', this.checked)" />
+    </label>
+  `;
+}
+
+function toggleOPOC(clientId, checked) {
+  const client = rosterState.roster.find(item => item.id === clientId);
+  if (!client) return;
+
+  client.opocCompleted = checked;
+  renderRoster();
+  saveRoster();
+}
+
+function getDischargeClass(client) {
+  const dischargeDate = getDischargeDate(client);
+  if (!dischargeDate) return "discharge-missing";
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const exit = new Date(dischargeDate + "T00:00:00");
+  const diffDays = Math.ceil((exit.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+
+  if (diffDays < 0) return "discharge-overdue";
+  if (diffDays <= 14) return "discharge-warning";
+  return "discharge-ok";
+}
+
+function getMissingAdmissionFields(client) {
+  const missing = [];
+
+  if (!client.roomNumber) missing.push("Room");
+  if (!client.clientId) missing.push("Client ID");
+  if (!client.dob) missing.push("DOB");
+  if (!client.phone) missing.push("Phone");
+  if ((client.phase || "phase1") === "phase2" ? !(client.phase2AdmissionDate || client.phase2EntryDate) : !client.entryDate) missing.push("Entry");
+  if (!getDischargeDate(client)) missing.push("Discharge");
+
+  return missing;
+}
+
+function getCompletionBadge(client) {
+  const missing = getMissingAdmissionFields(client);
+  const thc=kbrhActiveTHCScreen(client);
+  if(thc&&!thc.completed)return `<span class="status warning-status">THC Protocol</span>`;
+
+  if (!missing.length) {
+    return `<span class="status active">Complete</span>`;
+  }
+
+  return `<span class="status warning-status">Missing: ${escapeHtml(missing.join(", "))}</span>`;
+}
+
+function kbrhParseDate(value) {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value : null;
+  if (typeof value === "object" && typeof value.toDate === "function") {
+    const date = value.toDate();
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
+  if (typeof value === "object" && typeof value.seconds === "number") {
+    const date = new Date(value.seconds * 1000);
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(raw)
+    ? new Date(`${raw}T12:00:00`)
+    : new Date(raw);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function formatDate(value) {
+  const date = kbrhParseDate(value);
+  if (!date) return "—";
+  return date.toLocaleDateString("en-CA", {
+    year: "numeric", month: "short", day: "2-digit"
+  });
+}
+
+function kbrhRetentionUntil(client) {
+  const saved = kbrhParseDate(client.retentionUntil);
+  if (saved) return saved;
+  const discharge = kbrhParseDate(client.dischargedAt) ||
+    kbrhParseDate(client.archivedAt) ||
+    kbrhParseDate(getDischargeDate(client));
+  if (!discharge) return null;
+  const expiry = new Date(discharge.getTime());
+  expiry.setFullYear(expiry.getFullYear() + 2);
+  return expiry;
+}
+
+function formatDateTime(value) {
+  if (!value) return "";
+
+  const date = new Date(value);
+  return date.toLocaleString("en-CA", {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "numeric",
+    minute: "2-digit"
+  });
+}
+
+function startInlineEdit(clientId) {
+  if (editingAll) return;
+  openEditResidentModal(clientId);
+}
+
+function cancelInlineEdit() {
+  editingClientId = null;
+  renderRoster();
+}
+
+function startEditAll() {
+  editingClientId = null;
+  editingAll = true;
+  updateEditAllButtons();
+  renderRoster();
+}
+
+function cancelEditAll() {
+  editingAll = false;
+  updateEditAllButtons();
+  renderRoster();
+}
+
+function updateEditAllButtons() {
+  const editAllBtn = document.getElementById("editAllBtn");
+  const saveAllBtn = document.getElementById("saveAllBtn");
+  const cancelAllBtn = document.getElementById("cancelAllBtn");
+
+  if (!editAllBtn || !saveAllBtn || !cancelAllBtn) return;
+
+  editAllBtn.classList.toggle("hidden", editingAll);
+  saveAllBtn.classList.toggle("hidden", !editingAll);
+  cancelAllBtn.classList.toggle("hidden", !editingAll);
+  document.body.classList.toggle("roster-edit-all-active", editingAll);
+}
+
+function saveAllEdits() {
+  const roster = Array.isArray(rosterState.roster)
+    ? rosterState.roster.filter(client => client && client !== "temp" && !client.archived)
+    : [];
+
+  roster.forEach(client => saveClientFromEditInputs(client.id, false));
+
+  editingAll = false;
+  editingClientId = null;
+  updateEditAllButtons();
+  renderRoster();
+  saveRoster();
+}
+
+function saveClientFromEditInputs(clientId, shouldRender = true) {
+  const client = rosterState.roster.find(item => item.id === clientId);
+  if (!client) return;
+
+  const editBed=getInputValue(`editRoomNumber-${clientId}`);
+  if((client.phase||"phase1")==="phase1" && kbrhRejectUnreadyBed(editBed,client.roomNumber))return;
+  client.roomNumber = editBed;
+  client.firstName = getInputValue(`editFirstName-${clientId}`);
+  client.lastName = getInputValue(`editLastName-${clientId}`);
+  client.clientId = getInputValue(`editClientId-${clientId}`);
+  client.dob = getInputValue(`editDob-${clientId}`);
+  client.phone = formatPhoneNumber(getInputValue(`editPhone-${clientId}`));
+  client.expectedDischargeDate = getInputValue(`editDischargeDate-${clientId}`);
+
+  const opocInput = document.getElementById(`editOpoc-${clientId}`);
+  if (opocInput) {
+    client.opocCompleted = opocInput.checked;
+  }
+
+  if ((client.phase || "phase1") === "phase1") {
+    const candidateInput = document.getElementById(`editPhase2Candidate-${clientId}`);
+    if (candidateInput && candidateInput.checked !== Boolean(client.phase2Candidate)) kbrhSetCandidateFlag(client, candidateInput.checked);
+    client.address = kbrhDisplayAddress(getInputValue(`editAddress-${clientId}`));
+    client.city = getInputValue(`editCity-${clientId}`);
+    client.contact = getInputValue(`editContact-${clientId}`);
+    client.contactPhone = formatPhoneNumber(getInputValue(`editContactPhone-${clientId}`));
+    client.entryDate = getInputValue(`editEntryDate-${clientId}`);
+  } else {
+    client.phase2AdmissionDate = getInputValue(`editPhase2AdmissionDate-${clientId}`);
+    client.phase2EntryDate = client.phase2AdmissionDate;
+  }
+
+  normalizeResidentNamesOnSave(client);
+
+  if (shouldRender) {
+    editingClientId = null;
+    renderRoster();
+    saveRoster();
+  }
+}
+
+function saveInlineEdit(clientId) {
+  saveClientFromEditInputs(clientId, true);
+}
+
+
+function residentModalField(label, id, value, type = "text", full = false) {
+  return `
+    <label class="kbrh-modal-field ${full ? "kbrh-modal-field-full" : ""}">
+      <span>${escapeHtml(label)}</span>
+      <input id="${id}" type="${type}" value="${escapeAttribute(value || "")}" />
+    </label>
+  `;
+}
+
+function residentModalSection(title, description = "") {
+  return `
+    <div class="kbrh-modal-section-heading kbrh-modal-field-full">
+      <h3>${escapeHtml(title)}</h3>
+      ${description ? `<p>${escapeHtml(description)}</p>` : ""}
+    </div>
+  `;
+}
+
+function openEditResidentModal(clientId) {
+  const client = rosterState.roster.find(item => item && item.id === clientId);
+  const modal = document.getElementById("editResidentModal");
+  const fields = document.getElementById("editResidentFields");
+  if (!client || !modal || !fields) return;
+
+  editingClientId = clientId;
+  const phase = client.phase || "phase1";
+  const fullName = `${client.firstName || ""} ${client.lastName || ""}`.trim();
+  document.getElementById("editResidentModalSubtitle").textContent = fullName || "Update this resident's information.";
+
+  let html = residentModalSection("Resident Information");
+  html += `
+    <div class="kbrh-modal-field">
+      <label for="modalEditRoomNumber">Assigned Bed</label>
+      <div class="bed-picker-input">
+        <input id="modalEditRoomNumber" type="text" readonly value="${escapeAttribute(kbrhNormalizeBedId(client.roomNumber))}" placeholder="No bed assigned" />
+        <button type="button" class="secondary" id="chooseResidentBedBtn">Choose Bed</button>
+        <button type="button" class="secondary" id="clearResidentBedBtn">Clear</button>
+      </div>
+    </div>`;
+  html += residentModalField("Client ID", "modalEditClientId", client.clientId);
+  html += residentModalField("First Name", "modalEditFirstName", client.firstName);
+  html += residentModalField("Last Name", "modalEditLastName", client.lastName);
+  html += residentModalField("Date of Birth", "modalEditDob", client.dob, "date");
+  html += residentModalField("Phone", "modalEditPhone", client.phone);
+
+  if (phase === "phase1") {
+    html += residentModalSection("Contact and Address");
+    html += residentModalField("Address", "modalEditAddress", client.address, "text", true);
+    html += residentModalField("City", "modalEditCity", client.city);
+    html += residentModalField("Emergency Contact", "modalEditContact", client.contact);
+    html += residentModalField("Contact Phone", "modalEditContactPhone", client.contactPhone);
+    html += residentModalSection("Admission");
+    html += residentModalField("Entry Date", "modalEditEntryDate", client.entryDate, "date");
+  } else {
+    html += residentModalSection("Admission");
+    html += residentModalField("Phase 2 Entry Date", "modalEditPhase2AdmissionDate", client.phase2AdmissionDate, "date");
+  }
+
+  html += residentModalField("Expected Discharge Date", "modalEditDischargeDate", getDischargeDate(client), "date");
+  html += `
+    <label class="kbrh-modal-check">
+      <input id="modalEditOpoc" type="checkbox" ${client.opocCompleted ? "checked" : ""} />
+      <span>OPOC completed</span>
+    </label>
+  `;
+  if (phase === "phase1") html += `<label class="kbrh-modal-check"><input id="modalPhase2Candidate" type="checkbox" ${client.phase2Candidate ? "checked" : ""} /><span>Phase 2 Candidate — flagged by staff for consideration</span></label>`;
+  fields.innerHTML = html;
+  document.getElementById("chooseResidentBedBtn")?.addEventListener("click", openResidentBedPicker);
+  document.getElementById("clearResidentBedBtn")?.addEventListener("click", () => {
+    document.getElementById("modalEditRoomNumber").value = "";
+  });
+
+  modal.classList.remove("hidden");
+  document.body.classList.add("kbrh-modal-open");
+  requestAnimationFrame(() => document.getElementById("modalEditFirstName")?.focus());
+}
+
+function closeEditResidentModal() {
+  document.getElementById("editResidentModal")?.classList.add("hidden");
+  document.body.classList.remove("kbrh-modal-open");
+  editingClientId = null;
+}
+
+function saveEditResidentModal(event) {
+  event?.preventDefault();
+  const client = rosterState.roster.find(item => item && item.id === editingClientId);
+  if (!client) return;
+
+  const value = id => document.getElementById(id)?.value.trim() || "";
+  const firstName = value("modalEditFirstName");
+  const lastName = value("modalEditLastName");
+  if (!firstName || !lastName) {
+    alert("First and last name are required.");
+    return;
+  }
+
+  const requestedBed = kbrhNormalizeBedId(value("modalEditRoomNumber"));
+  if (requestedBed && !((client.phase === "phase2") ? KBRH_PHASE2_BEDS : KBRH_ROOM_BEDS).includes(requestedBed)) {
+    alert("Select a valid bed using Choose Bed."); return;
+  }
+  const occupant = client.phase === "phase2" ? kbrhPhase2Occupants(client.id).get(requestedBed) : (kbrhCurrentBedOccupants().get(requestedBed) || []).find(c => c.id !== client.id);
+  if (occupant) {
+    alert(`Bed ${requestedBed} is already occupied. Choose another bed.`); return;
+  }
+  if(client.phase !== "phase2" && kbrhRejectUnreadyBed(requestedBed,client.roomNumber))return;
+  client.roomNumber = requestedBed;
+  client.clientId = value("modalEditClientId");
+  client.firstName = firstName;
+  client.lastName = lastName;
+  client.dob = value("modalEditDob");
+  client.phone = formatPhoneNumber(value("modalEditPhone"));
+  client.expectedDischargeDate = value("modalEditDischargeDate");
+  client.opocCompleted = Boolean(document.getElementById("modalEditOpoc")?.checked);
+  if ((client.phase || "phase1") === "phase1") {
+    const candidateCheckbox = document.getElementById("modalPhase2Candidate");
+    if (candidateCheckbox && candidateCheckbox.checked !== Boolean(client.phase2Candidate))
+      kbrhSetCandidateFlag(client, candidateCheckbox.checked);
+  }
+
+  if ((client.phase || "phase1") === "phase1") {
+    client.address = value("modalEditAddress");
+    client.city = value("modalEditCity");
+    client.contact = value("modalEditContact");
+    client.contactPhone = formatPhoneNumber(value("modalEditContactPhone"));
+    client.entryDate = value("modalEditEntryDate");
+  } else {
+    client.phase2AdmissionDate = value("modalEditPhase2AdmissionDate");
+    client.phase2EntryDate = client.phase2AdmissionDate;
+  }
+
+  normalizeResidentNamesOnSave(client);
+
+  closeEditResidentModal();
+  renderRoster();
+  saveRoster();
+}
+
+// All authenticated staff can access screening history; Firestore enforces this server-side.
+function kbrhCanAccessUrineHistory() { return Boolean(auth?.currentUser); }
+
+const KBRH_PHASE2_BEDS = Object.freeze(['1','2','3','4','5','6','7','8']);
+function kbrhPhase2Occupants(excludeId) {
+  return new Map((rosterState.roster || [])
+    .filter(c=>c && !c.archived && c.phase==='phase2' && c.id!==excludeId && KBRH_PHASE2_BEDS.includes(String(c.roomNumber||'')))
+    .map(c=>[String(c.roomNumber),c]));
+}
+function kbrhPickPhase2Bed(excludeId,current) {
+  const occupied=kbrhPhase2Occupants(excludeId);
+  const options=KBRH_PHASE2_BEDS.filter(b=>!occupied.has(b));
+  if(!options.length){alert('All eight Phase 2 beds are occupied.');return null;}
+  const selected=prompt('Select a Phase 2 bed (1–8). Available: '+options.join(', '),options.includes(String(current))?String(current):options[0]);
+  if(selected===null)return null;
+  const bed=String(selected).trim();
+  if(!options.includes(bed)){alert('That Phase 2 bed is unavailable.');return null;}
+  return bed;
+}
+
+// A single Firestore roster transaction owns protocol status. Do not save a stale page snapshot.
+async function kbrhSetResidentTHCStatus(clientId,active,reason,screen=null){
+ const user=auth?.currentUser;
+ if(!user?.uid)throw Error("Staff sign-in required.");
+ if(!active && String(reason||"").trim().length<8)throw Error("A removal reason of at least 8 characters is required.");
+ const doc=db.collection("kbrh").doc("choreTracker"),when=new Date().toISOString();
+ kbrhPendingTHCStatuses.set(String(clientId),{active:!!active,when,confirmed:false});
+ let updated=null;
+ try { await db.runTransaction(async tx=>{
+  const snap=await tx.get(doc);
+  if(!snap.exists)throw Error("KBRH roster document is missing.");
+  const roster=Array.isArray(snap.data().roster)?snap.data().roster.slice():[];
+  const i=roster.findIndex(r=>String(r?.id)===String(clientId));
+  if(i<0)throw Error("Resident is no longer on the active roster.");
+  const previous=roster[i];
+  updated={...previous,thcProtocolActive:!!active,
+    admissionStatus:active?'THC Protocol':String(previous.admissionStatus||'').toLowerCase()==='thc protocol'?'':previous.admissionStatus,
+    thcRetestDue:active?(screen?.thcRetestDue||previous.thcRetestDue||null):null,
+    ...(active?{thcProtocolSetAt:when,thcProtocolClearedAt:null,thcProtocolClearReason:null}:
+       {thcProtocolClearedAt:when,thcProtocolClearedBy:user.uid,thcProtocolClearReason:reason.trim()})};
+  roster[i]=updated;
+  tx.update(doc,{roster,updatedAt:when});
+ });
+ } catch(error) { kbrhPendingTHCStatuses.delete(String(clientId)); throw error; }
+ const pending=kbrhPendingTHCStatuses.get(String(clientId));
+ if(pending)pending.confirmed=true;
+ const resident=rosterState.roster.find(r=>String(r?.id)===String(clientId));
+ if(resident)Object.assign(resident,updated);
+ renderRoster();
+ // Audit is non-blocking; the operational state is already committed.
+ try{await db.collection('kbrhAudit').add({page:'roster.html',action:active?'thc_protocol_activated':'thc_protocol_cleared',
+   residentId:clientId,staffUid:user.uid,staffEmail:user.email||'',
+   summary:active?'THC Protocol activated':'THC Protocol flag removed',
+   changes:[active?'THC Protocol activated':'THC Protocol deactivated',...(!active?['Reason: '+reason.trim()]:[])],
+   timestamp:firebase.firestore.Timestamp.fromDate(new Date(when))});}
+ catch(error){console.error('THC status saved but audit write failed',error);alert('THC status saved, but audit logging failed. Notify an administrator.');}
+ return updated;
+}
+async function kbrhClearUrineFlag(clientId,reason){return kbrhSetResidentTHCStatus(clientId,false,reason);}
+// Correct screening records without overwriting originals. Revision documents form the current view.
+async function kbrhCorrectUrineScreen(clientId,original,corrected,reason){
+ const user=auth?.currentUser;
+ if(!user?.uid)throw Error('Staff sign-in required.');
+ if(String(reason||'').trim().length<8)throw Error('A correction reason of at least 8 characters is required.');
+ const base=db.collection('kbrhUrineScreens').doc(clientId).collection('records').doc(original.id);
+ const when=new Date().toISOString();
+ const revision=base.collection('revisions').doc();
+ // A legacy embedded record is not rewritten; its correction lives in the same revision path.
+ await db.runTransaction(async tx=>{
+  const originalSnap=await tx.get(base);
+  const prior=originalSnap.exists?originalSnap.data():original;
+  if(!prior?.id || String(prior.id)!==String(original.id))throw Error('Screening ID mismatch.');
+  // Check current revisions to avoid overwriting an intervening correction.
+  const latestRef=base.collection('metadata').doc('current');
+  const latest=await tx.get(latestRef);
+  const expected=original.revisionId||null;
+  if((latest.exists?(latest.data().revisionId||null):null)!==expected)
+    throw Error('This screening was corrected by another staff member. Close and reopen history.');
+  const effective={...prior,...corrected,id:original.id,residentId:clientId,
+    correctedAt:when,correctedBy:user.displayName||user.email||user.uid,
+    correctedByUid:user.uid,correctionReason:reason.trim(),revisionId:revision.id};
+  tx.set(revision,{previous:original,updated:effective,reason:reason.trim(),staffUid:user.uid,
+    staffEmail:user.email||'',recordedAt:when});
+  tx.set(latestRef,{revisionId:revision.id,updatedAt:when,updatedByUid:user.uid});
+ });
+ try{await db.collection('kbrhAudit').add({page:'roster.html',action:'urine_screen_corrected',
+   residentId:clientId,screenId:original.id,summary:'Urine screening corrected',
+   changes:['Screen ID: '+original.id,'Reason: '+reason.trim(),'Original retained; correction in revision history'],
+   staffUid:user.uid,staffEmail:user.email||'',timestamp:firebase.firestore.Timestamp.fromDate(new Date(when))});}
+ catch(error){console.error('Correction saved but audit write failed',error);alert('Correction saved; central audit write failed. Notify an administrator.');}
+}
+function handleRosterAction(clientId, action) {
+  if(action==="clear-thc"){
+    if(!auth?.currentUser){alert("Please sign in.");return;}
+    const reason=prompt("Reason for removing THC Protocol (minimum 8 characters):","");
+    if(reason===null)return;
+    if(reason.trim().length<8){alert("Enter a reason of at least 8 characters.");return;}
+    if(!confirm("Remove THC Protocol flag? Screening results will remain in history."))return;
+    kbrhClearUrineFlag(clientId,reason).catch(e=>alert("Could not remove flag: "+(e.message||e)));
+    return;
+  }
+  if(action==="urine") {
+    if (!kbrhCanAccessUrineHistory()) {
+      alert("Authorized personnel only.");
+      return;
+    }
+    const client=rosterState.roster.find(c=>c.id===clientId);
+    if(!client)return;
+    // Append-only screening documents prevent unrelated roster saves overwriting history.
+    // Historical embedded screens remain available via KBRHUrine.loadHistory.
+    KBRHUrine.open(client,async screen=>{
+      const recordRef=db.collection("kbrhUrineScreens").doc(clientId).collection("records").doc(screen.id);
+      await recordRef.set({...screen,residentId:clientId,recordedByUid:auth.currentUser?.uid||""});
+      // Verify the exact record on the server, not the mutable shared roster.
+      const verified=await recordRef.get({source:"server"});
+      if(!verified.exists || verified.data()?.id!==screen.id)throw Error("Screening record was not confirmed on server");
+      client.urineScreens=[...(client.urineScreens||[]).filter(r=>r.id!==screen.id),screen];
+      if(screen.results?.THC==="Positive"){
+        try{await kbrhSetResidentTHCStatus(clientId,true,'',screen);}
+        catch(error){console.error('Screen saved but THC status update failed',error);alert('Screen saved, but THC Protocol could not be activated. Notify an administrator.');}
+      }
+      renderRoster();
+      if(typeof writeAuditEntry==="function")Promise.resolve().then(()=>writeAuditEntry(["Urine screening saved for resident "+clientId],{uid:auth.currentUser?.uid||"",email:auth.currentUser?.email||""})).catch(console.warn);
+    },false,{clearFlag:reason=>kbrhClearUrineFlag(clientId,reason),correctScreen:(original,corrected,reason)=>kbrhCorrectUrineScreen(clientId,original,corrected,reason)});
+    return;
+  }
+  if (!action) return;
+
+  if (action === "extend6") { grantPhase2Extension(clientId); return; }
+  if (action === "edit") openEditResidentModal(clientId);
+  if (action === "phase2") moveToPhase(clientId, "phase2");
+  if (action === "phase1") moveToPhase(clientId, "phase1");
+  if (action === "waitlist") moveBackToWaitlist(clientId);
+  if (action === "archive") archiveClient(clientId);
+  if (action === "restore") restoreClient(clientId);
+}
+
+let selectedRosterActionClientId = null;
+
+function openRosterActionsModal(clientId) {
+  const client = rosterState.roster.find(item => item.id === clientId);
+  if (!client) return;
+
+  selectedRosterActionClientId = clientId;
+  const name = `${client.firstName || ""} ${client.lastName || ""}`.trim() || "Selected client";
+  const nameElement = document.getElementById("rosterActionsName");
+  const actionList = document.getElementById("rosterActionList");
+
+  if (nameElement) nameElement.textContent = name;
+  if (actionList) {
+    const isArchived = Boolean(client.archived);
+    const phase = client.phase || "phase1";
+
+    actionList.innerHTML = isArchived
+      ? `
+        <button type="button" data-roster-action="restore">Restore</button>\n        <button type="button" data-roster-action="urine">Urine Screens / History</button>
+      `
+      : `
+        <button type="button" data-roster-action="edit">Edit</button>\n        <button type="button" data-roster-action="urine">Urine Screens / History</button>
+        ${phase === "phase1" ? '<button type="button" data-roster-action="clear-thc" class="secondary">Remove THC Protocol Flag</button>' : ""}
+        <button type="button" data-roster-action="${phase === "phase1" ? "phase2" : "phase1"}">Move to ${phase === "phase1" ? "Phase 2" : "Phase 1"}</button>
+        ${phase === "phase2" ? '<button type="button" data-roster-action="extend6">Grant 6-Month Extension</button>' : ""}
+        <button type="button" data-roster-action="waitlist">Move back to Waitlist</button>
+        <button type="button" data-roster-action="archive">Archive / Discharge</button>
+      `;
+
+    actionList.querySelectorAll('[data-roster-action="urine"]').forEach(button => {
+      if (!kbrhCanAccessUrineHistory()) {
+        button.disabled = true;
+        button.title = "Authorized personnel only.";
+        button.setAttribute("aria-label", "Urine Screens / History — Authorized personnel only");
+        button.style.opacity = "0.45";
+        button.style.cursor = "not-allowed";
+      }
+    });
+
+    actionList.querySelectorAll("[data-roster-action]").forEach(button => {
+      button.addEventListener("click", () => {
+        const action = button.dataset.rosterAction;
+        closeRosterActionsModal();
+        handleRosterAction(clientId, action);
+      });
+    });
+  }
+
+  document.getElementById("rosterActionsModal")?.classList.remove("hidden");
+}
+
+function closeRosterActionsModal() {
+  document.getElementById("rosterActionsModal")?.classList.add("hidden");
+  selectedRosterActionClientId = null;
+}
+
+
+function moveBackToWaitlist(clientId) {
+  const client = rosterState.roster.find(item => item.id === clientId);
+  if (!client) return;
+
+  if (!confirm(`Move ${client.firstName} ${client.lastName} back to the waitlist?`)) return;
+
+  rosterState.waitlist = Array.isArray(rosterState.waitlist)
+    ? rosterState.waitlist.filter(item => item && item !== "temp")
+    : [];
+
+  const priorWaitlistRecord = rosterState.waitlist.find(item => {
+    if (!item || !item.dateApplied) return false;
+    if (client.waitlistSourceId && item.id === client.waitlistSourceId) return true;
+
+    const sameName = String(item.firstName || "").trim().toLowerCase() === String(client.firstName || "").trim().toLowerCase()
+      && String(item.lastName || "").trim().toLowerCase() === String(client.lastName || "").trim().toLowerCase();
+    const itemPhone = String(item.contact || "").replace(/\D/g, "");
+    const clientPhone = String(client.phone || "").replace(/\D/g, "");
+    const samePhone = itemPhone && clientPhone && itemPhone === clientPhone;
+
+    return sameName && (samePhone || !itemPhone || !clientPhone);
+  });
+
+  const originalApplicationDate = client.originalApplicationDate
+    || priorWaitlistRecord?.originalApplicationDate
+    || priorWaitlistRecord?.dateApplied
+    || "";
+
+  const transferNote = {
+    id: crypto.randomUUID(),
+    text: `Moved back to the waitlist from the current roster on ${new Date().toLocaleDateString("en-CA")}.`,
+    createdAt: new Date().toISOString()
+  };
+
+  const existingNotes = Array.isArray(client.notes)
+    ? client.notes.map(note => ({
+        id: note.id || crypto.randomUUID(),
+        text: note.text || "",
+        createdAt: note.createdAt || new Date().toISOString()
+      })).filter(note => note.text)
+    : [];
+
+  rosterState.waitlist.push({
+    id: crypto.randomUUID(),
+    lastName: client.lastName || "",
+    firstName: client.firstName || "",
+    contact: formatPhoneNumber(client.phone || ""),
+    status: "Returned from Roster",
+    city: client.city || "",
+    dateApplied: originalApplicationDate,
+    originalApplicationDate,
+    archived: false,
+    archivedAt: "",
+    archiveReason: "",
+    callPriority: "normal",
+    notes: [transferNote, ...existingNotes],
+    callInHistory: []
+  });
+
+  client.archived = true;
+  client.archivedAt = new Date().toISOString();
+  client.archiveReason = "Moved back to Waitlist";
+  client.notes = Array.isArray(client.notes) ? client.notes : [];
+  client.notes.unshift({
+    id: crypto.randomUUID(),
+    author: "System",
+    text: `Moved back to the waitlist on ${new Date().toLocaleDateString("en-CA")}.`,
+    createdAt: new Date().toISOString()
+  });
+
+  editingClientId = null;
+  editingAll = false;
+  updateEditAllButtons();
+  renderRoster();
+  saveRoster();
+}
+
+async function grantPhase2Extension(clientId) {
+ const client=rosterState.roster.find(x=>x&&x.id===clientId);
+ if(!client||client.archived||client.phase!=="phase2")return;
+ const start=client.expectedDischargeDate||client.phase2AdmissionDate||client.phase2EntryDate;
+ if(!start||!/^\d{4}-\d{2}-\d{2}$/.test(start)){alert("Set the Phase 2 entry date or expected discharge date first.");return;}
+ const [y,m,d]=start.split("-").map(Number),target=m-1+6;
+ const end=new Date(y,target,Math.min(d,new Date(y,target+1,0).getDate()));
+ const next=[end.getFullYear(),String(end.getMonth()+1).padStart(2,"0"),String(end.getDate()).padStart(2,"0")].join("-");
+ if(!confirm(`Grant a six-month extension to ${client.firstName} ${client.lastName}? New discharge date: ${next}`))return;
+ const previous=client.expectedDischargeDate;
+ client.expectedDischargeDate=next;
+ client.phase2Extensions=[...(Array.isArray(client.phase2Extensions)?client.phase2Extensions:[]),{grantedAt:new Date().toISOString(),previousDischargeDate:previous||"",newDischargeDate:next,staffUid:typeof auth!=="undefined"?(auth.currentUser?.uid||""):""}];
+ appendPersonActivity(client,"Phase 2","Six-month extension granted",`New discharge date: ${next}`);
+ renderRoster();
+ if(!(await saveRoster())){client.expectedDischargeDate=previous;client.phase2Extensions.pop();renderRoster();}
+}
+
+function moveToPhase(clientId, phase) {
+  const client = rosterState.roster.find(item => item.id === clientId);
+  if (!client) return;
+
+  if (phase === 'phase2') {
+    const selected=kbrhPickPhase2Bed(client.id, client.phase==='phase2'?client.roomNumber:'');
+    if(!selected)return;
+    client.roomNumber=selected;
+  } else if (client.phase === 'phase2') {
+    // Phase 1 uses an independent inventory; never carry Phase 2 bed numbers across.
+    client.roomNumber='';
+  }
+  if ((client.phase || "phase1") === "phase1" && phase !== "phase1") {
+    client.phase2Candidate = false;
+    kbrhPendingCandidateFlags.delete(client.id);
+  }
+  client.phase = phase;
+  appendPersonActivity(client,"Phase",phase==="phase2"?"Moved to Phase 2":"Moved to Phase 1","");
+
+  if (phase === "phase2") {
+    client.phase2AdmissionDate = KBRHDates.today();
+    client.phase2EntryDate = client.phase2AdmissionDate;
+  }
+
+  renderRoster();
+  saveRoster();
+}
+
+async function archiveClient(clientId) {
+  const client = rosterState.roster.find(item => item.id === clientId);
+  if (!client) return;
+
+  pendingDischargeClientId = clientId;
+  const name = `${client.firstName || ""} ${client.lastName || ""}`.trim();
+  document.getElementById("dischargeResidentName").textContent = name;
+  document.getElementById("dischargeOutcome").value = "";
+  document.getElementById("dischargeNotes").value = "";
+  document.getElementById("dischargeModal").classList.remove("hidden");
+  document.body.classList.add("kbrh-modal-open");
+}
+
+function closeDischargeModal() {
+  pendingDischargeClientId = null;
+  document.getElementById("dischargeModal")?.classList.add("hidden");
+  document.body.classList.remove("kbrh-modal-open");
+}
+
+async function confirmDischarge() {
+  const clientId = pendingDischargeClientId;
+  const localClient = rosterState.roster.find(item => item.id === clientId);
+  if (!localClient) return closeDischargeModal();
+
+  const select = document.getElementById("dischargeOutcome");
+  const outcomeCode = select.value;
+  const outcomeLabel = select.options[select.selectedIndex]?.textContent?.trim() || "";
+  const dischargeNotes = document.getElementById("dischargeNotes").value.trim();
+  if (!outcomeCode) { alert("Select a discharge reason."); return; }
+
+  if (!confirm(`Confirm discharge / archive\n\nResident: ${localClient.firstName} ${localClient.lastName}\nDischarge date: ${new Date().toLocaleDateString("en-CA")}\nReason: ${outcomeLabel}\n\nThis starts the 2-year retention period and contributes to repeat-admission history.`)) return;
+
+  const user = auth.currentUser;
+  if (!user) { alert("Your login session has expired. Please sign in again before archiving a resident."); return; }
+
+  let identity = { uid:user.uid||"", email:user.email||"", name:user.email||"Staff User" };
+  if (typeof getCurrentStaffIdentity === "function") {
+    try { identity = await getCurrentStaffIdentity(); }
+    catch (error) { console.warn("Staff profile lookup failed during archive; using authenticated identity.", error); }
+  }
+
+  const archivedAt = new Date().toISOString();
+  const retentionDate = new Date(archivedAt);
+  retentionDate.setFullYear(retentionDate.getFullYear() + 2);
+  const retentionUntil = retentionDate.toISOString();
+  const archiveReason = outcomeLabel;
+  const appRef = APP_DOC_REF();
+
+  try {
+    const latestSnap = await appRef.get({ source:"server" });
+    if (!latestSnap.exists) throw new Error("Shared KBRH application record was not found.");
+
+    const latest = normalizeAppState(latestSnap.data());
+    const roster = Array.isArray(latest.roster) ? latest.roster.map(r => ({...r})) : [];
+    const index = roster.findIndex(item => item && item.id === clientId);
+    if (index < 0) throw new Error("Resident was not found in the current shared roster.");
+
+    const resident = { ...roster[index] };
+    resident.archived = true;
+    resident.archivedAt = archivedAt;
+    resident.dischargedAt = archivedAt;
+    resident.retentionUntil = retentionUntil;
+    resident.archiveReason = archiveReason;
+    resident.dischargeOutcomeCode = outcomeCode;
+    resident.dischargeOutcomeLabel = outcomeLabel;
+    resident.dischargeNotes = dischargeNotes;
+    resident.archivedBy = identity.name || identity.email || "Staff User";
+    resident.archivedByUid = identity.uid || "";
+    resident.archivedByEmail = identity.email || "";
+    appendPersonActivity(resident,"Archive","Resident archived / discharged",[archiveReason, dischargeNotes].filter(Boolean).join(" — "),identity,archivedAt);
+    resident.notes = Array.isArray(resident.notes) ? [...resident.notes] : [];
+    resident.notes.unshift({
+      id: crypto.randomUUID(), author: resident.archivedBy, authorUid: resident.archivedByUid, authorEmail: resident.archivedByEmail,
+      text: `Archived from roster on ${new Date(archivedAt).toLocaleDateString("en-CA")}. Reason: ${archiveReason}.${dischargeNotes ? ` Notes: ${dischargeNotes}` : ""}`, createdAt: archivedAt
+    });
+    roster[index] = resident;
+
+    const cleanRoster = normalizeAppState({ roster }).roster;
+    await appRef.update({ roster: cleanRoster, updatedAt: archivedAt });
+
+    const verifySnap = await appRef.get({ source:"server" });
+    if (!verifySnap.exists) throw new Error("Archive save could not be verified.");
+    const verified = normalizeAppState(verifySnap.data());
+    const verifiedClient = verified.roster.find(item => item.id === clientId);
+    if (!verifiedClient || verifiedClient.archived !== true) throw new Error("Firestore returned the resident as active after the archive save.");
+
+    rosterState = verified; KBRH_LAST_STATE = normalizeAppState(verified);
+    closeDischargeModal(); renderRoster();
+    if (typeof writeAuditEntry === "function") {
+      writeAuditEntry([`Archived resident: ${verifiedClient.firstName || ""} ${verifiedClient.lastName || ""} — ${archiveReason}`.trim()], identity)
+        .catch(error => console.warn("Archive audit entry failed, but the resident archive was saved.", error));
+    }
+  } catch (error) {
+    console.error("Resident archive failed:", error);
+    const code = error?.code ? ` [${error.code}]` : "";
+    const message = error?.message ? `\n\n${error.message}` : "";
+    alert(`Could not archive resident${code}. The resident was NOT removed from the active roster.${message}`);
+    try { const latest = await appRef.get({ source:"server" }); if (latest.exists) rosterState = normalizeAppState(latest.data()); } catch (_) {}
+    renderRoster();
+  }
+}
+
+function restoreClient(clientId) {
+  const client = rosterState.roster.find(item => item.id === clientId);
+  if (!client) return;
+
+  if (!confirm(`Restore ${client.firstName} ${client.lastName} to the active roster?`)) return;
+
+  client.archived = false;
+  appendPersonActivity(client,"Restore","Resident restored to active roster","");
+  client.archivedAt = "";
+  client.archiveReason = "";
+  client.dischargeOutcomeCode = "";
+  client.dischargeOutcomeLabel = "";
+  client.dischargeNotes = "";
+
+  client.notes = Array.isArray(client.notes) ? client.notes : [];
+  client.notes.unshift({
+    id: crypto.randomUUID(),
+    author: "System",
+    text: `Restored to active roster on ${new Date().toLocaleDateString("en-CA")}.`,
+    createdAt: new Date().toISOString()
+  });
+
+  renderRoster();
+  saveRoster();
+}
+
+function openNotes(clientId) {
+  const client = rosterState.roster.find(item => item.id === clientId);
+  if (!client) return;
+
+  notesClientId = clientId;
+
+  document.getElementById("notesModalTitle").textContent =
+    `Notes — ${client.firstName || ""} ${client.lastName || ""}`.trim();
+
+  document.getElementById("noteAuthor").value = typeof currentStaffName === "function" ? currentStaffName() : "";
+  document.getElementById("noteAuthor").readOnly = true;
+  document.getElementById("newNoteText").value = "";
+
+  renderNotesModal(client);
+  document.getElementById("notesModal").classList.remove("hidden");
+}
+
+function closeNotesModal() {
+  notesClientId = null;
+  document.getElementById("notesModal").classList.add("hidden");
+}
+
+function addClientNote() {
+  const client = rosterState.roster.find(item => item.id === notesClientId);
+  if (!client) return;
+
+  const author = typeof currentStaffName === "function" ? currentStaffName() : getInputValue("noteAuthor");
+  const text = getInputValue("newNoteText");
+
+  if (!author) {
+    alert("Please enter your name.");
+    return;
+  }
+
+  if (!text) {
+    alert("Enter a note first.");
+    return;
+  }
+
+  client.notes = Array.isArray(client.notes) ? client.notes : [];
+
+  client.notes.unshift({
+    id: crypto.randomUUID(),
+    author,
+    text,
+    createdAt: new Date().toISOString()
+  });
+  appendPersonActivity(client,"Note","Resident note added",text);
+
+  document.getElementById("noteAuthor").value = "";
+  document.getElementById("newNoteText").value = "";
+
+  renderNotesModal(client);
+  renderRoster();
+  saveRoster();
+}
+
+function deleteClientNote(noteId) {
+  const client = rosterState.roster.find(item => item.id === notesClientId);
+  if (!client) return;
+
+  if (!confirm("Delete this note?")) return;
+
+  client.notes = Array.isArray(client.notes)
+    ? client.notes.filter(note => note.id !== noteId)
+    : [];
+
+  renderNotesModal(client);
+  renderRoster();
+  saveRoster();
+}
+
+function renderNotesModal(client) {
+  const list = document.getElementById("notesList");
+  if (!list) return;
+
+  const notes = Array.isArray(client.notes) ? client.notes : [];
+
+  list.innerHTML = notes.length
+    ? notes.map(note => `
+        <li class="note-item">
+          <div>
+            <div><strong>${escapeHtml(note.author || "Unknown")}</strong></div>
+            <div>• ${escapeHtml(note.text)}</div>
+            <small>${escapeHtml(formatDateTime(note.createdAt))}</small>
+          </div>
+          <button type="button" class="danger" onclick="deleteClientNote('${note.id}')">Delete</button>
+        </li>
+      `).join("")
+    : `<li class="empty">No notes yet.</li>`;
+}
+
+function handleRosterSearch(value) {
+  rosterSearchTerm = String(value || "").toLowerCase().trim();
+  renderRoster();
+}
+
+function matchesRosterSearch(client) {
+  if (!rosterSearchTerm) return true;
+
+  const haystack = [
+    client.roomNumber,
+    client.firstName,
+    client.lastName,
+    client.clientId,
+    client.phone,
+    client.city
+  ].join(" ").toLowerCase();
+
+  return haystack.includes(rosterSearchTerm);
+}
+
+function renderRoster() {
+  updateEditAllButtons();
+  document.body.classList.toggle("kbrh-editing-roster",Boolean(editingAll || editingClientId));
+  updatePhase1ResidentCount();
+  updateRoomTrackers();
+  renderPhase1Roster();
+  renderResidentCards();
+  renderPhase2Roster();
+  renderArchivedRoster();
+}
+
+function updatePhase1ResidentCount() {
+  const capacity = 18;
+  const count = Array.isArray(rosterState.roster)
+    ? rosterState.roster.filter(client =>
+        client &&
+        client !== "temp" &&
+        !client.archived &&
+        (client.phase || "phase1") === "phase1"
+      ).length
+    : 0;
+
+  const countElement = document.getElementById("phase1ResidentCount");
+  const detailElement = document.getElementById("phase1CapacityDetail");
+  const card = document.getElementById("phase1ResidentCard");
+  if (!countElement || !detailElement || !card) return;
+
+  const available = Math.max(capacity - count, 0);
+  countElement.textContent = String(count);
+  detailElement.textContent = count >= capacity
+    ? "FULL"
+    : `${available} bed${available === 1 ? "" : "s"} empty`;
+
+  card.classList.remove("capacity-open", "capacity-near", "capacity-full");
+  if (count >= capacity) card.classList.add("capacity-full");
+  else if (count === capacity - 1) card.classList.add("capacity-near");
+  else card.classList.add("capacity-open");
+}
+
+function getPhaseClients(phase) {
+  return Array.isArray(rosterState.roster)
+    ? rosterState.roster
+        .filter(client =>
+          client &&
+          client !== "temp" &&
+          !client.archived &&
+          (client.phase || "phase1") === phase &&
+          matchesRosterSearch(client)
+        )
+        .sort((a, b) => {
+          const aDate = a.entryDate || "9999-12-31";
+          const bDate = b.entryDate || "9999-12-31";
+          return aDate.localeCompare(bDate);
+        })
+    : [];
+}
+
+function getArchivedClients() {
+  return Array.isArray(rosterState.roster)
+    ? rosterState.roster
+        .filter(client => client && client !== "temp" && client.archived && matchesRosterSearch(client))
+        .sort((a, b) => String(b.archivedAt || "").localeCompare(String(a.archivedAt || "")))
+    : [];
+}
+
+
+// Phase 1 compact resident cards; original roster table remains available during Edit All.
+function kbrhApplyTHCProtocol(client,screen){
+ if(screen?.results?.THC!=="Positive")return;
+ client.admissionStatus="THC Protocol";
+ client.notes=Array.isArray(client.notes)?client.notes:[];
+ client.notes.unshift({id:crypto.randomUUID(),author:"KBRH Intake",text:`THC Protocol — Retest due ${screen.thcRetestDue}. Admission screening positive for THC on ${screen.date}. Follow-up screening required in 45 days.`,createdAt:new Date().toISOString()});
+}
+function kbrhActiveTHCScreen(client){
+ if(!client||client.thcProtocolActive===false||client.thcProtocolClearedAt && client.thcProtocolActive!==true)return null;
+ if(client.thcProtocolActive===true)return {record:{thcRetestDue:client.thcRetestDue||null},completed:false};
+ // Legacy-only fallback for records predating the explicit status field.
+ const screens=Array.isArray(client.urineScreens)?client.urineScreens:[];
+ const positive=screens.filter(r=>String(r?.results?.THC||'').toLowerCase()==='positive');
+ if(!positive.length && String(client.admissionStatus||'').toLowerCase()!=='thc protocol')return null;
+ const last=positive.sort((a,b)=>String(a.date||'').localeCompare(String(b.date||''))).at(-1);
+ return {record:{thcRetestDue:client.thcRetestDue||last?.thcRetestDue||null},completed:false,legacy:true};
+}
+function kbrhCardOPOC(client){
+ if(client.opocCompleted)return '<span class="krc-tag krc-good">OPOC Complete</span>';
+ if(client.entryDate && getDaysSinceAdmission(client)>=40)return '<span class="krc-tag krc-warn">OPOC Due</span>';
+ return '';
+}
+function kbrhTHCTags(client){
+ const screen=kbrhActiveTHCScreen(client);
+ if(!screen)return '';
+ const date=screen.record.thcRetestDue;
+ const now=new Date();const today=[now.getFullYear(),String(now.getMonth()+1).padStart(2,"0"),String(now.getDate()).padStart(2,"0")].join("-");
+ const status=screen.completed?'Retest completed':!date?'Retest date unavailable':today<date?'Retest: '+formatDate(date):today===date?'Retest due today':'Retest overdue';
+ // A completed follow-up is not, by itself, authorization to remove protocol status.
+ return '<span class="krc-thc-alert" role="status"><span class="krc-thc-title"><span class="krc-thc-leaf" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 1l2.2 5.4 2.5-2-0.2 4 4.4-1.1-2.6 4 3.7 2.5-5.8 1.1 1.4 3.6-4.4-2.3-.3 6.8h-1.8l-.3-6.8-4.4 2.3 1.4-3.6L2 13.8l3.7-2.5-2.6-4 4.4 1.1-.2-4 2.5 2L12 1z"/></svg></span> THC PROTOCOL</span><span class="krc-thc-date">'+escapeHtml(status)+'</span></span>';
+}
+function renderResidentCards(){
+ const target=document.getElementById('phase1ResidentCards');if(!target)return;
+ // Position is global to the active Phase 1 roster, not the current search result.
+ const all=Array.isArray(rosterState.roster)?rosterState.roster.filter(c=>c&&c!=="temp"&&!c.archived&&(c.phase||"phase1")==="phase1"):[];
+ all.sort((a,b)=>String(a.entryDate||"9999-12-31").localeCompare(String(b.entryDate||"9999-12-31"))||String(a.id||"").localeCompare(String(b.id||"")));
+ const positions=new Map(all.map((c,i)=>[c.id,i+1]));
+ const clients=getPhaseClients('phase1');
+ target.innerHTML=clients.length?clients.map(c=>{
+ const id=escapeHtml(String(c.id||''));
+ const discharge=getDischargeDate(c);
+ const remaining=calculateDaysRemainingForClient(c);
+ const remainingNumber=Number.parseInt(remaining,10);
+ const remainingClass=!discharge?'krc-days-none':remaining==='Today'||remaining==='Due / Past'?'krc-days-urgent':Number.isFinite(remainingNumber)&&remainingNumber<=7?'krc-days-soon':'krc-days-ok';
+ return `<article class="p2-card phase1-matched-card">
+  <div class="p2-card-head"><strong>♟ ${escapeHtml([c.lastName,c.firstName].filter(Boolean).join(', ')||'Unnamed resident')} <span class="kbrh-client-id-badge">ID: ${escapeHtml(c.clientId||'—')}</span></strong><span class="p1-roster-position" title="Phase 1 roster position">#${positions.get(c.id)||'—'}</span></div>
+  <div class="p2-card-content">
+   <div class="p1-status-flags">${c.phase2Candidate ? '<span class="krc-candidate-flag">PHASE 2 CANDIDATE</span>' : ''}${kbrhTHCTags(c)}<div class="p1-opoc-flag">${kbrhCardOPOC(c)}</div></div>
+   <div class="p2-field"><span>Room</span><strong>${escapeHtml(kbrhNormalizeBedId(c.roomNumber)||'—')}</strong></div>
+   <div class="p2-field"><span>Client ID</span><strong>${escapeHtml(c.clientId||'—')}</strong></div>
+   <div class="p2-field"><span>Contact</span><strong>${escapeHtml([c.contact,c.contactPhone].filter(Boolean).join(' · ')||c.phone||'—')}</strong></div>
+   <div class="p2-field"><span>Entry Date</span><strong>${escapeHtml(c.entryDate?formatDate(c.entryDate):'—')}</strong></div>
+   <div class="p2-field"><span>Exit Date</span><strong>${escapeHtml(discharge?formatDate(discharge):'—')}</strong></div>
+   <div class="p2-field"><span>Days Remaining</span><strong class="${remainingClass}">${escapeHtml(remaining||'—')}</strong></div>
+   <div class="p2-actions"><button type="button" onclick="openRosterActionsModal('${id}')">Actions / Edit</button><button type="button" class="secondary" onclick="openNotes('${id}')">Notes</button></div>
+  </div>
+ </article>`
+ }).join(''):'<p class="empty">No Phase 1 residents.</p>';
+}
+
+function renderPhase1Roster() {
+  const body = document.getElementById("rosterBody");
+  const compactBody = document.getElementById("compactRosterBody");
+  if (!body) return;
+
+  const roster = getPhaseClients("phase1");
+
+  body.innerHTML = roster.length
+    ? roster.map(client => renderActiveRosterRow(client, "phase1")).join("")
+    : `<tr><td colspan="17" class="empty">No Phase 1 clients.</td></tr>`;
+
+  if (compactBody) {
+    compactBody.innerHTML = roster.length
+      ? roster.map(client => renderCompactRosterRow(client)).join("")
+      : `<tr><td colspan="6" class="empty">No Phase 1 clients.</td></tr>`;
+  }
+}
+
+function renderPhase2Cards(clients) {
+ const target=document.getElementById("phase2ResidentCards");if(!target)return;
+ target.innerHTML=clients.length?clients.map(c=>{
+  const id=escapeAttribute(String(c.id||""));
+  const entry=c.phase2AdmissionDate||c.phase2EntryDate||"";
+  const discharge=getDischargeDate(c);
+  const extended=Array.isArray(c.phase2Extensions)&&c.phase2Extensions.length>0;
+  const name=[c.lastName,c.firstName].filter(Boolean).join(", ")||"Unnamed resident";
+  const field=(label,value)=>`<div class="p2-field"><span>${label}</span><strong>${escapeHtml(value||"—")}</strong></div>`;
+  return `<article class="p2-card"><div class="p2-card-head"><strong>♟ ${escapeHtml(name)} <span class="kbrh-client-id-badge">ID: ${escapeHtml(c.clientId||'—')}</span></strong>${extended?'<span class="p2-extension">6-Month Extension</span>':''}</div>
+   <div class="p2-card-content">${field("Room",kbrhNormalizeBedId(c.roomNumber))}${field("Client ID",c.clientId)}${field("Contact",[c.contact,c.contactPhone].filter(Boolean).join(" · ")||c.phone)}${field("Entry Date",entry?formatDate(entry):"")}${field("Exit Date",discharge?formatDate(discharge):"")}
+   <div class="p2-actions"><button type="button" onclick="openRosterActionsModal('${id}')">Actions / Edit</button><button type="button" class="secondary" onclick="openNotes('${id}')">Notes</button></div></div></article>`;
+ }).join(""):'<p class="empty">No Phase 2 residents.</p>';
+}
+
+function renderPhase2Roster() {
+  const body = document.getElementById("phase2RosterBody");
+  const compactBody = document.getElementById("compactPhase2RosterBody");
+  if (!body) return;
+
+  const roster = getPhaseClients("phase2");
+  renderPhase2Cards(roster);
+
+  body.innerHTML = roster.length
+    ? roster.map(client => renderActiveRosterRow(client, "phase2")).join("")
+    : `<tr><td colspan="12" class="empty">No Phase 2 clients.</td></tr>`;
+
+  if (compactBody) {
+    compactBody.innerHTML = roster.length
+      ? roster.map(client => renderCompactRosterRow(client)).join("")
+      : `<tr><td colspan="6" class="empty">No Phase 2 clients.</td></tr>`;
+  }
+}
+
+function renderCompactRosterRow(client) {
+  const daysRemaining = calculateDaysRemainingForClient(client);
+  const dischargeClass = getDischargeClass(client);
+  const fullName = `${client.firstName || ""} ${client.lastName || ""}`.trim() || "Unnamed resident";
+
+  return `
+    <tr>
+      <td class="compact-room-cell">${escapeHtml(kbrhNormalizeBedId(client.roomNumber) || "—")}</td>
+      <td class="compact-name-cell"><strong>${escapeHtml(fullName)}</strong><span>Client ID: ${escapeHtml(client.clientId || "—")}</span></td>
+      <td class="${dischargeClass}">${escapeHtml(daysRemaining)}</td>
+      <td>${getCompletionBadge(client)}</td>
+      <td><button type="button" class="secondary compact-info-button" onclick="openResidentInfoModal('${client.id}')">Display Info</button></td>
+      <td><button type="button" class="actions-button" onclick="openRosterActionsModal('${client.id}')">Actions</button></td>
+    </tr>
+  `;
+}
+
+function residentInfoItem(label, value, full = false) {
+  return `
+    <div class="resident-info-item ${full ? "resident-info-item-full" : ""}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value || "—")}</strong>
+    </div>
+  `;
+}
+
+function incomeSourceLabel(value) {
+  return ({employment:"Employment",odsp:"ODSP",ow:"Ontario Works",ei:"Employment Insurance (EI)",cpp:"CPP / CPP-D",pension:"Pension / Retirement",none:"No Current Income",other:"Other"}[value] || value || "—");
+}
+
+function getResidentPrescreening(client) {
+  if (client?.preScreening) return client.preScreening;
+  const records = Array.isArray(rosterState?.preScreenings) ? rosterState.preScreenings : [];
+  return records.find(r => r?.id && r.id === client?.preScreeningRecordId)
+    || records.filter(r => r?.applicantId && r.applicantId === client?.waitlistSourceId).sort((a,b) => String(b.updatedAt||b.completedAt||"").localeCompare(String(a.updatedAt||a.completedAt||"")))[0]
+    || null;
+}
+
+function openResidentInfoModal(clientId) {
+  const client = rosterState.roster.find(item => item && item.id === clientId);
+  const modal = document.getElementById("residentInfoModal");
+  const body = document.getElementById("residentInfoBody");
+  if (!client || !modal || !body) return;
+
+  const phase = client.phase || "phase1";
+  const fullName = `${client.firstName || ""} ${client.lastName || ""}`.trim() || "Resident";
+  const dischargeDate = getDischargeDate(client);
+  const daysRemaining = calculateDaysRemainingForClient(client);
+  const noteCount = Array.isArray(client.notes) ? client.notes.length : 0;
+  document.getElementById("residentInfoModalSubtitle").textContent = fullName;
+
+  let html = `<section class="resident-info-section"><h3>Resident</h3><div class="resident-info-grid">`;
+  html += residentInfoItem("Room #", kbrhNormalizeBedId(client.roomNumber));
+  html += residentInfoItem("Client ID", client.clientId);
+  html += residentInfoItem("First Name", client.firstName);
+  html += residentInfoItem("Last Name", client.lastName);
+  html += residentInfoItem("Date of Birth", formatDate(client.dob));
+  html += residentInfoItem("Phone", client.phone);
+  html += `</div></section>`;
+
+  if (phase === "phase1") {
+    html += `<section class="resident-info-section"><h3>Contact and Address</h3><div class="resident-info-grid">`;
+    html += residentInfoItem("Address", client.address, true);
+    html += residentInfoItem("City", client.city);
+    html += residentInfoItem("Emergency Contact", client.contact);
+    html += residentInfoItem("Contact Phone", client.contactPhone);
+    html += `</div></section>`;
+  }
+
+  html += `<section class="resident-info-section"><h3>Admission</h3><div class="resident-info-grid">`;
+  html += residentInfoItem(phase === "phase1" ? "Entry Date" : "Phase 2 Entry Date", formatDate(phase === "phase1" ? client.entryDate : client.phase2AdmissionDate));
+  html += residentInfoItem("Expected Discharge", formatDate(dischargeDate));
+  html += residentInfoItem("Days Left", daysRemaining);
+  html += residentInfoItem("OPOC", client.opocCompleted ? "Complete" : "Incomplete");
+  html += residentInfoItem("Admission Status", client.admissionCompleted ? "Complete" : "Incomplete");
+  html += residentInfoItem("Notes", `${noteCount} note${noteCount === 1 ? "" : "s"}`);
+  html += `</div></section>`;
+
+  const prescreen = getResidentPrescreening(client);
+  if (prescreen) {
+    const px = prescreen.answers || {};
+    html += `<section class="resident-info-section"><h3>Pre-Screening</h3><div class="resident-info-grid">`;
+    html += residentInfoItem("Completed", formatDate(prescreen.completedAt || prescreen.updatedAt));
+    html += residentInfoItem("Outcome", prescreen.workflowStatus || prescreen.outcome || "—");
+    html += residentInfoItem("Current Income Source", incomeSourceLabel(px.incomeSource || client.currentIncomeSource));
+    html += residentInfoItem("Employer / Source", px.incomeSourceName || client.currentIncomeSourceName || "—");
+    html += residentInfoItem("Approx. Monthly Income", (px.monthlyIncome || client.monthlyIncome) ? `$${px.monthlyIncome || client.monthlyIncome}` : "—");
+    html += residentInfoItem("Income Notes", px.incomeNotes || client.incomeNotes || "—", true);
+    html += residentInfoItem("Pre-Screening Notes", prescreen.overallNotes || "No overall pre-screening notes recorded.", true);
+    html += `</div></section>`;
+  }
+  const activity=[...normalizeActivityHistory(client.activityHistory),...(Array.isArray(client.notes)?client.notes.map(note=>({id:`note-${note.id}`,summary:"Note",detail:note.text||"",staffName:note.author||"Unknown",createdAt:note.createdAt||""})):[])].filter(x=>x.createdAt).sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)));
+  html += `<section class="resident-info-section"><h3>Activity History</h3><div class="person-activity-list">${activity.length?activity.map(entry=>`<article class="person-activity-item"><div><strong>${escapeHtml(entry.summary||entry.type||"Activity")}</strong><span>${escapeHtml(entry.detail||"")}</span></div><small>${escapeHtml(formatDateTime(entry.createdAt))} · ${escapeHtml(entry.staffName||"System")}</small></article>`).join(""):`<p class="empty">No activity recorded yet.</p>`}</div></section>`;
+
+  body.innerHTML = html;
+  modal.classList.remove("hidden");
+  document.body.classList.add("kbrh-modal-open");
+  requestAnimationFrame(() => document.getElementById("closeResidentInfoModalBtn")?.focus());
+}
+
+function closeResidentInfoModal() {
+  document.getElementById("residentInfoModal")?.classList.add("hidden");
+  document.body.classList.remove("kbrh-modal-open");
+}
+
+function renderActiveRosterRow(client, phase) {
+  const isEditing = editingAll;
+  const dischargeDate = getDischargeDate(client);
+  const daysRemaining = calculateDaysRemainingForClient(client);
+  const noteCount = Array.isArray(client.notes) ? client.notes.length : 0;
+  const dischargeClass = getDischargeClass(client);
+
+  if (isEditing) {
+    if (phase === "phase1") {
+      return `
+        <tr class="editing-row">
+          <td><input id="editRoomNumber-${client.id}" value="${escapeAttribute(kbrhNormalizeBedId(client.roomNumber))}" /></td>
+          <td><input id="editFirstName-${client.id}" value="${escapeAttribute(client.firstName)}" /></td>
+          <td><input id="editLastName-${client.id}" value="${escapeAttribute(client.lastName)}" /></td>
+          <td><input id="editClientId-${client.id}" value="${escapeAttribute(client.clientId)}" /></td>
+          <td><input id="editDob-${client.id}" type="date" value="${escapeAttribute(client.dob)}" /></td>
+          <td class="phone-cell"><input id="editPhone-${client.id}" value="${escapeAttribute(client.phone)}" /></td>
+          <td><input id="editAddress-${client.id}" value="${escapeAttribute(client.address)}" /></td>
+          <td><input id="editCity-${client.id}" value="${escapeAttribute(client.city)}" /></td>
+          <td><input id="editContact-${client.id}" value="${escapeAttribute(client.contact)}" /></td>
+          <td class="phone-cell"><input id="editContactPhone-${client.id}" value="${escapeAttribute(client.contactPhone)}" /></td>
+          <td><input id="editEntryDate-${client.id}" type="date" value="${escapeAttribute(client.entryDate)}" /></td>
+          <td><input id="editDischargeDate-${client.id}" type="date" value="${escapeAttribute(dischargeDate)}" /></td>
+          <td class="${dischargeClass}">${escapeHtml(daysRemaining)}</td>
+          <td><input id="editOpoc-${client.id}" type="checkbox" ${client.opocCompleted ? "checked" : ""} /><label style="display:block;font-size:11px"><input id="editPhase2Candidate-${client.id}" type="checkbox" ${client.phase2Candidate ? "checked" : ""} /> Phase 2 candidate</label></td>
+          <td>${getCompletionBadge(client)}</td>
+          <td><a href="#" onclick="openNotes('${client.id}'); return false;">Notes (${noteCount})</a></td>
+          <td>
+            ${
+              editingAll
+                ? `<span class="empty">Use Save All above</span>`
+                : `
+                  <button type="button" class="success" onclick="saveInlineEdit('${client.id}')">Save</button>
+                  <button type="button" class="secondary" onclick="cancelInlineEdit()">Cancel</button>
+                `
+            }
+          </td>
+        </tr>
+      `;
+    }
+
+    return `
+      <tr class="editing-row">
+        <td><input id="editRoomNumber-${client.id}" value="${escapeAttribute(kbrhNormalizeBedId(client.roomNumber))}" /></td>
+        <td><input id="editFirstName-${client.id}" value="${escapeAttribute(client.firstName)}" /></td>
+        <td><input id="editLastName-${client.id}" value="${escapeAttribute(client.lastName)}" /></td>
+        <td><input id="editClientId-${client.id}" value="${escapeAttribute(client.clientId)}" /></td>
+        <td><input id="editDob-${client.id}" type="date" value="${escapeAttribute(client.dob)}" /></td>
+        <td class="phone-cell"><input id="editPhone-${client.id}" value="${escapeAttribute(client.phone)}" /></td>
+        <td><input id="editPhase2AdmissionDate-${client.id}" type="date" value="${escapeAttribute(client.phase2AdmissionDate)}" /></td>
+        <td><input id="editDischargeDate-${client.id}" type="date" value="${escapeAttribute(dischargeDate)}" /></td>
+        <td class="${dischargeClass}">${escapeHtml(daysRemaining)}</td>
+        <td>${getCompletionBadge(client)}</td>
+        <td><a href="#" onclick="openNotes('${client.id}'); return false;">Notes (${noteCount})</a></td>
+        <td>
+          ${
+            editingAll
+              ? `<span class="empty">Use Save All above</span>`
+              : `
+                <button type="button" class="success" onclick="saveInlineEdit('${client.id}')">Save</button>
+                <button type="button" class="secondary" onclick="cancelInlineEdit()">Cancel</button>
+              `
+          }
+        </td>
+      </tr>
+    `;
+  }
+
+  if (phase === "phase1") {
+    return `
+      <tr>
+        <td>${escapeHtml(kbrhNormalizeBedId(client.roomNumber))}</td>
+        <td>${escapeHtml(client.firstName)}</td>
+        <td>${escapeHtml(client.lastName)}</td>
+        <td>${escapeHtml(client.clientId)}</td>
+        <td>${escapeHtml(formatDate(client.dob))}</td>
+        <td class="phone-cell">${escapeHtml(client.phone)}</td>
+        <td>${escapeHtml(client.address)}</td>
+        <td>${escapeHtml(client.city)}</td>
+        <td>${escapeHtml(client.contact)}</td>
+        <td class="phone-cell">${escapeHtml(client.contactPhone)}</td>
+        <td>${escapeHtml(formatDate(client.entryDate))}</td>
+        <td>${escapeHtml(formatDate(dischargeDate))}</td>
+        <td class="${dischargeClass}">${escapeHtml(daysRemaining)}</td>
+        <td>${getOPOCStatus(client)}</td>
+        <td>${getCompletionBadge(client)}</td>
+        <td><a href="#" onclick="openNotes('${client.id}'); return false;">Notes (${noteCount})</a></td>
+        <td>
+          <button type="button" class="actions-button" onclick="openRosterActionsModal('${client.id}')">Actions</button>
+        </td>
+      </tr>
+    `;
+  }
+
+  return `
+    <tr>
+      <td>${escapeHtml(kbrhNormalizeBedId(client.roomNumber))}</td>
+      <td>${escapeHtml(client.firstName)}</td>
+      <td>${escapeHtml(client.lastName)}</td>
+      <td>${escapeHtml(client.clientId)}</td>
+      <td>${escapeHtml(formatDate(client.dob))}</td>
+      <td class="phone-cell">${escapeHtml(client.phone)}</td>
+      <td>${escapeHtml(formatDate(client.phase2AdmissionDate))}</td>
+      <td>${escapeHtml(formatDate(dischargeDate))}</td>
+      <td class="${dischargeClass}">${escapeHtml(daysRemaining)}</td>
+      <td>${getCompletionBadge(client)}</td>
+      <td><a href="#" onclick="openNotes('${client.id}'); return false;">Notes (${noteCount})</a></td>
+      <td>
+        <button type="button" class="actions-button" onclick="openRosterActionsModal('${client.id}')">Actions</button>
+      </td>
+    </tr>
+  `;
+}
+
+function renderArchivedRoster() {
+  const body = document.getElementById("archivedRosterBody");
+  if (!body) return;
+
+  const archived = getArchivedClients();
+
+  body.innerHTML = archived.length
+    ? archived.map(client => {
+        const noteCount = Array.isArray(client.notes) ? client.notes.length : 0;
+
+        return `
+          <tr>
+            <td>${escapeHtml(kbrhNormalizeBedId(client.roomNumber))}</td>
+            <td>${escapeHtml(client.firstName)}</td>
+            <td>${escapeHtml(client.lastName)}</td>
+            <td>${escapeHtml(client.clientId)}</td>
+            <td>${escapeHtml(client.phone)}</td>
+            <td>${escapeHtml(formatDate(client.entryDate))}</td>
+            <td>${escapeHtml(formatDate(KBRHDates.dateOnly(client.dischargedAt || client.archivedAt || "")))}</td>
+            <td>${escapeHtml(formatDateTime(client.archivedAt))}</td>
+            <td>${escapeHtml(formatDate(kbrhRetentionUntil(client)))}</td>
+            <td>${escapeHtml(client.archiveReason)}</td>
+            <td><a href="#" onclick="openNotes('${client.id}'); return false;">Notes (${noteCount})</a></td>
+            <td>
+              <button type="button" class="actions-button" onclick="openRosterActionsModal('${client.id}')">Actions</button>
+            </td>
+          </tr>
+        `;
+      }).join("")
+    : `<tr><td colspan="12" class="empty">No archived roster records.</td></tr>`;
+}
+
+function escapeHtml(value) {
+  return String(value || "").replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;"
+  }[char]));
+}
+
+function escapeAttribute(value) {
+  return escapeHtml(value);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("closeResidentInfoModalBtn")?.addEventListener("click", closeResidentInfoModal);
+  document.getElementById("closeResidentInfoModalFooterBtn")?.addEventListener("click", closeResidentInfoModal);
+  document.getElementById("residentInfoModal")?.addEventListener("mousedown", event => {
+    if (event.target.id === "residentInfoModal") closeResidentInfoModal();
+  });
+
+  document.getElementById("closeRosterActionsModalBtn")?.addEventListener("click", closeRosterActionsModal);
+  document.getElementById("cancelRosterActionsModalBtn")?.addEventListener("click", closeRosterActionsModal);
+  document.getElementById("rosterActionsModal")?.addEventListener("mousedown", event => {
+    if (event.target.id === "rosterActionsModal") closeRosterActionsModal();
+  });
+
+  document.addEventListener("keydown", event => {
+    if (event.key !== "Escape") return;
+    if (!document.getElementById("residentInfoModal")?.classList.contains("hidden")) {
+      closeResidentInfoModal();
+      return;
+    }
+    if (!document.getElementById("rosterActionsModal")?.classList.contains("hidden")) {
+      closeRosterActionsModal();
+    }
+  });
+});
+
+auth.onAuthStateChanged(user => {
+  if (!user) return;
+
+  listenToAppState(nextState => {
+    // A delayed snapshot must not visually roll back an unsynchronized staff edit.
+    for (const client of (nextState.roster || [])) {
+      if (!client || !kbrhPendingCandidateFlags.has(client.id)) continue;
+      if ((client.phase || "phase1") !== "phase1") { kbrhPendingCandidateFlags.delete(client.id); continue; }
+      const desired = kbrhPendingCandidateFlags.get(client.id);
+      if (Boolean(client.phase2Candidate) === desired) {
+        kbrhPendingCandidateFlags.delete(client.id);
+      } else {
+        client.phase2Candidate = desired;
+      }
+    }
+    // Firestore's listener performs asynchronous migration work. An older
+    // callback can arrive after a newer one, and must not re-display the flag.
+    for(const client of (nextState.roster||[])){
+      const pending=kbrhPendingTHCStatuses.get(String(client?.id));
+      if(!pending)continue;
+      const serverTime=String(client?.thcProtocolClearedAt||client?.thcProtocolSetAt||'');
+      if(Boolean(client.thcProtocolActive)===pending.active && serverTime>=pending.when){
+        kbrhPendingTHCStatuses.delete(String(client.id));
+      }else{
+        client.thcProtocolActive=pending.active;
+        if(!pending.active){
+          client.thcProtocolClearedAt=pending.when;
+          client.thcRetestDue=null;
+          if(String(client.admissionStatus||'').toLowerCase()==='thc protocol')client.admissionStatus='';
+        }
+      }
+    }
+    rosterState = nextState;
+
+    rosterState.roster = Array.isArray(rosterState.roster)
+      ? rosterState.roster.filter(client => client && client !== "temp")
+      : [];
+
+    rosterState.roster.forEach(client => {
+      client.roomNumber = kbrhNormalizeBedId(client.roomNumber);
+      client.phase = client.phase || "phase1";
+      client.notes = Array.isArray(client.notes) ? client.notes : [];
+      client.phase2AdmissionDate = client.phase2AdmissionDate || client.phase2EntryDate || "";
+      client.phase2EntryDate = client.phase2AdmissionDate;
+      client.expectedDischargeDate = client.expectedDischargeDate || calculateExitDate(client.entryDate);
+      client.opocCompleted = client.opocCompleted || false;
+      client.archived = client.archived || false;
+      client.archivedAt = client.archivedAt || "";
+      client.archiveReason = client.archiveReason || "";
+      client.phone = formatPhoneNumber(client.phone);
+      client.contactPhone = formatPhoneNumber(client.contactPhone);
+    });
+
+    renderRoster();
+  });
+});
+
+
+/* v3.3 roster viewport and column visibility controls */
+(function initializeRosterDisplayControls() {
+  const STORAGE_KEY = "kbrhRosterVisibleColumnsV33";
+  const defaultVisibility = {
+    dob: true,
+    phone: true,
+    address: true,
+    city: true,
+    contact: true,
+    contactPhone: true,
+    entryDate: true,
+    dischargeDate: true,
+    daysRemaining: true,
+    opoc: true,
+    admissionStatus: true,
+    notes: true
+  };
+
+  function readVisibility() {
+    try {
+      return { ...defaultVisibility, ...JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}") };
+    } catch (error) {
+      return { ...defaultVisibility };
+    }
+  }
+
+  function saveVisibility(visibility) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(visibility));
+  }
+
+  function applyVisibility(visibility) {
+    Object.keys(defaultVisibility).forEach(column => {
+      document.body.classList.toggle(`hide-roster-${column}`, visibility[column] === false);
+    });
+
+    document.querySelectorAll("[data-roster-column]").forEach(input => {
+      input.checked = visibility[input.dataset.rosterColumn] !== false;
+    });
+  }
+
+  function setup() {
+    const panel = document.getElementById("rosterColumnPanel");
+    const toggleButton = document.getElementById("toggleRosterColumnsBtn");
+    const showAllButton = document.getElementById("showAllRosterColumnsBtn");
+    if (!panel || !toggleButton) return;
+
+    let visibility = readVisibility();
+    applyVisibility(visibility);
+
+    toggleButton.addEventListener("click", () => {
+      const opening = panel.classList.contains("hidden");
+      panel.classList.toggle("hidden", !opening);
+      toggleButton.setAttribute("aria-expanded", String(opening));
+      toggleButton.textContent = opening ? "Close Columns" : "Choose Columns";
+    });
+
+    document.querySelectorAll("[data-roster-column]").forEach(input => {
+      input.addEventListener("change", () => {
+        visibility[input.dataset.rosterColumn] = input.checked;
+        saveVisibility(visibility);
+        applyVisibility(visibility);
+      });
+    });
+
+    showAllButton?.addEventListener("click", () => {
+      visibility = { ...defaultVisibility };
+      saveVisibility(visibility);
+      applyVisibility(visibility);
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", setup, { once: true });
+  } else {
+    setup();
+  }
+})();
+
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("editResidentForm")?.addEventListener("submit", saveEditResidentModal);
+  document.getElementById("closeEditResidentModalBtn")?.addEventListener("click", closeEditResidentModal);
+  document.getElementById("cancelEditResidentModalBtn")?.addEventListener("click", closeEditResidentModal);
+  document.getElementById("editResidentModal")?.addEventListener("click", event => {
+    if (event.target?.id === "editResidentModal") closeEditResidentModal();
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && !document.getElementById("editResidentModal")?.classList.contains("hidden")) {
+      closeEditResidentModal();
+    }
+  });
+});
+
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("closeDischargeModalBtn")?.addEventListener("click", closeDischargeModal);
+  document.getElementById("cancelDischargeModalBtn")?.addEventListener("click", closeDischargeModal);
+  document.getElementById("confirmDischargeBtn")?.addEventListener("click", confirmDischarge);
+  document.getElementById("dischargeModal")?.addEventListener("mousedown", e => { if (e.target.id === "dischargeModal") closeDischargeModal(); });
+});
+
+// Room inventory: room 5 does not exist. All other beds have stable IDs.
+const KBRH_SINGLE_ROOMS = new Set([3,4,6,9,10,11,13,14]);
+const KBRH_ROOM_NUMBERS = Object.freeze([1,2,3,4,6,7,8,9,10,11,12,13,14]);
+const KBRH_ROOM_BEDS = Object.freeze(KBRH_ROOM_NUMBERS.flatMap(room =>
+  KBRH_SINGLE_ROOMS.has(room) ? [String(room)] : [`${room}-1`, `${room}-2`]));
+// Accept legacy single-room identifiers (e.g. 6-1) without losing occupancy.
+function kbrhNormalizeBedId(value) {
+  const id = String(value ?? '').trim();
+  const match = id.match(/^(3|4|6|9|10|11|13|14)-1$/);
+  return match ? match[1] : id;
+}
+function kbrhBedIsInRoom(bed, room) {
+  return bed === String(room) || bed.startsWith(`${room}-`);
+}
+function kbrhBedReady(bed){
+  const key=kbrhNormalizeBedId(bed);
+  // Unready (including not-yet-marked-ready) beds cannot be assigned.
+  return rosterState.bedReadiness?.[key]?.ready===true;
+}
+function kbrhBedAssignmentAllowed(bed,previousBed=''){
+  const key=kbrhNormalizeBedId(bed);
+  return !key || key===kbrhNormalizeBedId(previousBed) || kbrhBedReady(key);
+}
+function kbrhRejectUnreadyBed(bed,previousBed=''){
+  if(kbrhBedAssignmentAllowed(bed,previousBed))return false;
+  alert(`Bed ${bed} is unavailable. Mark it Ready on the Bed Readiness page before assigning a resident.`);
+  return true;
+}
+function kbrhCurrentBedOccupants(){
+  const result = new Map();
+  (rosterState.roster || []).filter(c=>c && !c.archived && (c.phase || 'phase1') === 'phase1').forEach(c=>{
+    const bed = kbrhNormalizeBedId(c.roomNumber);
+    if(KBRH_ROOM_BEDS.includes(bed)){
+      if(!result.has(bed))result.set(bed,[]);
+      result.get(bed).push(c);
+    }
+  });
+  return result;
+}
+function kbrhPhaseOneResidents(){
+  return (rosterState.roster || []).filter(c => c && c !== 'temp' && !c.archived && (c.phase || 'phase1') === 'phase1');
+}
+function kbrhDoubleRoomResidents(){
+  return kbrhPhaseOneResidents().filter(c => {
+    const bed=kbrhNormalizeBedId(c.roomNumber);
+    return KBRH_ROOM_BEDS.includes(bed) && !KBRH_SINGLE_ROOMS.has(Number(bed));
+  });
+}
+function kbrhNextSingleRoomResident(){
+  // Roster priority follows the Phase 1 roster's entry-date ordering, not the current search filter.
+  return kbrhDoubleRoomResidents().sort((a,b) =>
+    String(a.entryDate || '9999-12-31').localeCompare(String(b.entryDate || '9999-12-31')) ||
+    (rosterState.roster.indexOf(a)-rosterState.roster.indexOf(b)))[0] || null;
+}
+function updateRoomTrackers(){
+  const occupied=kbrhCurrentBedOccupants();
+  const openRooms=KBRH_ROOM_NUMBERS.filter(room=>
+    KBRH_ROOM_BEDS.some(bed=>kbrhBedIsInRoom(bed,room) && !occupied.has(bed) && kbrhBedReady(bed)));
+  const rooms=document.getElementById('availableRoomNumbers');
+  if(rooms)rooms.textContent=openRooms.length ? openRooms.join(', ') : 'None';
+  const next=document.getElementById('nextSingleRoomResident');
+  if(next){
+    const resident=kbrhNextSingleRoomResident();
+    next.textContent=resident ? [resident.firstName,resident.lastName].filter(Boolean).join(' ') : 'None Waiting';
+  }
+}
+function kbrhOpenSingleRoomAssignment(bed){
+  if(kbrhCurrentBedOccupants().has(bed)||kbrhRejectUnreadyBed(bed)){renderRoomAvailability();return;}
+  const modal=document.getElementById('singleRoomAssignModal');
+  const list=document.getElementById('singleRoomAssignList');
+  if(!modal || !list)return;
+  document.getElementById('singleRoomAssignTitle').textContent=`Assign Room ${bed}`;
+  list.replaceChildren();
+  const candidates=kbrhPhaseOneResidents().filter(c=>{
+    const current=kbrhNormalizeBedId(c.roomNumber);
+    return !KBRH_SINGLE_ROOMS.has(Number(current)) && (!KBRH_ROOM_BEDS.includes(current) || current.includes('-'));
+  }).sort((a,b)=>String(a.entryDate||'9999-12-31').localeCompare(String(b.entryDate||'9999-12-31')) || rosterState.roster.indexOf(a)-rosterState.roster.indexOf(b));
+  if(!candidates.length){
+    const message=document.createElement('p');message.textContent='No eligible residents. Residents already in single rooms cannot be selected.';list.append(message);
+  }
+  candidates.forEach(resident=>{
+    const button=document.createElement('button');button.type='button';button.className='room-bed available';
+    button.textContent=[resident.firstName,resident.lastName].filter(Boolean).join(' ') || 'Unnamed Resident';
+    button.addEventListener('click',async()=>{
+      if(kbrhCurrentBedOccupants().has(bed)){alert('Room is no longer available.');renderRoomAvailability();return;}
+      const previous=kbrhNormalizeBedId(resident.roomNumber);
+      if(KBRH_SINGLE_ROOMS.has(Number(previous))){alert('Resident is already in a single room.');return;}
+      if(kbrhRejectUnreadyBed(bed,resident.roomNumber))return;
+       resident.roomNumber=bed;
+      button.disabled=true;
+      if(!await saveRoster()){resident.roomNumber=previous;button.disabled=false;return;}
+      modal.classList.add('hidden');renderRoster();renderRoomAvailability();
+    });
+    list.append(button);
+  });
+  modal.classList.remove('hidden');
+}
+function renderRoomAvailability(){
+  const occupied=kbrhCurrentBedOccupants();
+  const grid=document.getElementById('roomAvailabilityGrid');
+  if(!grid)return;
+  const rooms=[1,2,3,4,6,7,8,9,10,11,12,13,14];
+  grid.replaceChildren();
+  rooms.forEach(room=>{
+    const card=document.createElement('section');card.className='room-availability-room';
+    const heading=document.createElement('h3');heading.textContent=`Room ${room}`;card.append(heading);
+    KBRH_ROOM_BEDS.filter(id=>kbrhBedIsInRoom(id,room)).forEach(bed=>{
+      const residents=occupied.get(bed)||[];
+      const btn=document.createElement('button');btn.type='button';
+      btn.className=`room-bed ${residents.length?'occupied':!kbrhBedReady(bed)?'unavailable':'available'}`;
+      btn.textContent=`${bed} — ${residents.length ? residents.map(c=>`${c.firstName||''} ${c.lastName||''}`.trim()).join(', ') + (residents.length>1?' (CONFLICT)':'') : kbrhBedReady(bed)?'Available':'Unavailable'}`;
+      if(residents.length||!kbrhBedReady(bed)){btn.disabled=true;}else{btn.addEventListener('click',()=>KBRH_SINGLE_ROOMS.has(Number(bed)) ? kbrhOpenSingleRoomAssignment(bed) : assignAvailableBed(bed));}
+      card.append(btn);
+    });grid.append(card);
+  });
+  const count=KBRH_ROOM_BEDS.filter(b=>!occupied.has(b)&&kbrhBedReady(b)).length;
+  document.getElementById('roomAvailabilitySummary').textContent=`${count} available / 18 total beds · 13 rooms`;
+}
+async function assignAvailableBed(bed){
+  if(kbrhCurrentBedOccupants().has(bed)||kbrhRejectUnreadyBed(bed)){renderRoomAvailability();return;}
+  const residents=(rosterState.roster||[]).filter(c=>c && !c.archived && (c.phase||'phase1')==='phase1');
+  const candidates=residents.filter(c=>!KBRH_ROOM_BEDS.includes(kbrhNormalizeBedId(c.roomNumber)));
+  if(!candidates.length){alert('No unassigned Phase 1 residents. Edit a resident to transfer them to this bed.');return;}
+  const options=candidates.map((c,i)=>`${i+1}. ${c.firstName||''} ${c.lastName||''}`.trim()).join('\n');
+  const answer=prompt(`Assign bed ${bed} to which unassigned resident? Enter a number:\n${options}`);
+  if(answer===null)return;
+  const index=Number(answer)-1;
+  if(!Number.isInteger(index)||!candidates[index]){alert('Invalid resident selection.');return;}
+  if(kbrhCurrentBedOccupants().has(bed)){alert('This bed is already occupied.');renderRoomAvailability();return;}
+  if(kbrhRejectUnreadyBed(bed))return;
+  const resident=candidates[index], old=resident.roomNumber;
+  if(kbrhRejectUnreadyBed(bed,resident.roomNumber))return;
+       resident.roomNumber=bed;
+  if(!await saveRoster()){resident.roomNumber=old;return;}
+  renderRoster();renderRoomAvailability();
+}
+function openResidentBedPicker(){
+  const modal=document.getElementById("residentBedPickerModal");
+  const grid=document.getElementById("residentBedPickerGrid");
+  if(!modal || !grid || !editingClientId)return;
+  const editingResident=rosterState.roster.find(c=>c.id===editingClientId);
+  if(editingResident?.phase==='phase2') {
+    const occupied=kbrhPhase2Occupants(editingClientId);
+    const current=String(document.getElementById('modalEditRoomNumber')?.value||'');
+    grid.replaceChildren();
+    KBRH_PHASE2_BEDS.forEach(bed=>{
+      const card=document.createElement('section');card.className='room-availability-room';
+      const button=document.createElement('button');button.type='button';button.className='room-bed '+(occupied.has(bed)?'occupied':'available');
+      button.textContent='Phase 2 Bed '+bed+(occupied.has(bed)?' — Occupied: '+[occupied.get(bed).firstName,occupied.get(bed).lastName].filter(Boolean).join(' '):bed===current?' — Current selection':' — Available');
+      button.disabled=occupied.has(bed);
+      button.addEventListener('click',()=>{document.getElementById('modalEditRoomNumber').value=bed;closeResidentBedPicker();});
+      card.append(button);grid.append(card);
+    });
+    document.getElementById('residentBedPickerSummary').textContent=`${8-occupied.size} selectable beds · 8 Phase 2 beds`;
+    modal.classList.remove('hidden');return;
+  }
+  const occupied=kbrhCurrentBedOccupants();
+  const current=kbrhNormalizeBedId(document.getElementById("modalEditRoomNumber")?.value || "");
+  grid.replaceChildren();
+  [1,2,3,4,6,7,8,9,10,11,12,13,14].forEach(room=>{
+    const card=document.createElement("section");
+    card.className="room-availability-room";
+    const h=document.createElement("h3");h.textContent=`Room ${room}`;card.append(h);
+    KBRH_ROOM_BEDS.filter(b=>kbrhBedIsInRoom(b,room)).forEach(bed=>{
+      const others=(occupied.get(bed)||[]).filter(c=>c.id!==editingClientId);
+      const button=document.createElement("button");button.type="button";
+      const unavailable=!kbrhBedAssignmentAllowed(bed,editingResident?.roomNumber);
+      button.className=`room-bed ${others.length?"occupied":unavailable?"unavailable":"available"}`;
+      button.textContent=`${bed} — ${others.length ? "Occupied: "+others.map(c=>`${c.firstName||""} ${c.lastName||""}`.trim()).join(", ") : bed===current ? "Current selection" : unavailable ? "Unavailable" : "Available"}`;
+      button.disabled=others.length>0||unavailable;
+      if(!others.length&&!unavailable)button.addEventListener("click",()=>{
+        document.getElementById("modalEditRoomNumber").value=bed;
+        closeResidentBedPicker();
+      });
+      card.append(button);
+    });
+    grid.append(card);
+  });
+  document.getElementById("residentBedPickerSummary").textContent=`${KBRH_ROOM_BEDS.filter(b=>!(occupied.get(b)||[]).some(c=>c.id!==editingClientId)&&kbrhBedAssignmentAllowed(b,editingResident?.roomNumber)).length} selectable beds · 18 total`;
+  modal.classList.remove("hidden");
+}
+function closeResidentBedPicker(){
+  document.getElementById("residentBedPickerModal")?.classList.add("hidden");
+}
+document.addEventListener("DOMContentLoaded",()=>{
+  ["closeResidentBedPickerBtn","cancelResidentBedPickerBtn"].forEach(id=>
+    document.getElementById(id)?.addEventListener("click",closeResidentBedPicker));
+  document.getElementById("residentBedPickerModal")?.addEventListener("click",e=>{
+    if(e.target.id==="residentBedPickerModal")closeResidentBedPicker();
+  });
+  document.addEventListener("keydown",e=>{if(e.key==="Escape")closeResidentBedPicker();});
+});
+function closeRoomAvailability(){document.getElementById('roomAvailabilityModal')?.classList.add('hidden');}
+document.addEventListener('DOMContentLoaded',()=>{
+  document.getElementById('openRoomAvailabilityBtn')?.addEventListener('click',()=>{renderRoomAvailability();document.getElementById('roomAvailabilityModal')?.classList.remove('hidden');});
+  ['closeRoomAvailabilityBtn','roomAvailabilityCloseFooter'].forEach(id=>document.getElementById(id)?.addEventListener('click',closeRoomAvailability));
+  document.getElementById('roomAvailabilityModal')?.addEventListener('click',e=>{if(e.target.id==='roomAvailabilityModal')closeRoomAvailability();});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')closeRoomAvailability();});
+});
+
+document.addEventListener('DOMContentLoaded',()=>{
+  document.getElementById('closeSingleRoomAssignBtn')?.addEventListener('click',()=>document.getElementById('singleRoomAssignModal')?.classList.add('hidden'));
+  document.getElementById('singleRoomAssignModal')?.addEventListener('click',e=>{if(e.target.id==='singleRoomAssignModal')e.currentTarget.classList.add('hidden');});
+});
