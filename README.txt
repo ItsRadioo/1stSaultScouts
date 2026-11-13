@@ -1,23 +1,37 @@
-1st Sault Ste. Marie Scout Group — Flat GitHub Pages Upload
+1st Sault Ste. Marie Scout Group Website — Version 2
 
-This version contains no folders.
+Dominant colour theme:
+- Scouts red
+- Black / charcoal
+- White / warm off-white
+- Green and gold accents
 
-Upload every file in this package directly to the root of the main branch.
-Do not upload the outer folder or the ZIP itself.
+Included pages:
+- Home
+- About
+- Sections
+- Beavers
+- Cubs
+- Scouts
+- Venturers
+- Rovers
+- Parents
+- Uniforms
+- Volunteer
+- Contact
+- Trail Ready Program
+- FAQ
+- 404 page
+- Join landing page
 
-The root of the repository should show:
-- index.html
-- site.css
-- main.js
-- hero.webp
-- beavers.webp
-- cubs.webp
-- scouts.webp
-- venturers.webp
-- rovers.webp
-- all other HTML pages
+Important placeholders:
+Search the project for:
+- PLACE_HOLDER
+- YOUR_EMAIL_ADDRESS
+- (705) 000-0000
+- +17050000000
 
-GitHub Pages settings:
-- Source: Deploy from a branch
-- Branch: main
-- Folder: /(root)
+Upload:
+Upload all files and folders in this package to the root of your GitHub Pages repository.
+
+The site is static and requires no build step.
