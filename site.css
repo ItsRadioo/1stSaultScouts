@@ -1585,3 +1585,11 @@ select {
     grid-template-columns: 1fr;
   }
 }
+
+/* November 2026: social links and responsive homepage invitation */
+.footer-main { grid-template-columns: 1.2fr repeat(4, minmax(0, 1fr)); }
+.social-inner { display: flex; align-items: center; justify-content: space-between; gap: 2rem; }
+.social-inner > div { max-width: 660px; }
+.social-inner .button { flex-shrink: 0; }
+@media (max-width: 1050px) { .footer-main { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .footer-main { grid-template-columns: 1fr; } .social-inner { align-items: flex-start; flex-direction: column; } }
